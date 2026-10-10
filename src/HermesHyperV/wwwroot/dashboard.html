@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>hyperv-sandbox — dashboard</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --border:#2d333b; --fg:#e6edf3; --dim:#8b949e;
+          --accent:#4493f8; --ok:#30a46c; --warn:#f76b15; --err:#e5484d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.5 "Segoe UI",system-ui,sans-serif; }
+  .wrap { max-width:1100px; margin:0 auto; padding:16px; }
+  header { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+  header h1 { font-size:17px; margin:0; }
+  .pill { font-size:11px; padding:2px 9px; border-radius:99px; border:1px solid var(--border); color:var(--dim); }
+  .pill.live { color:var(--ok); border-color:var(--ok); }
+  .pill.warn { color:var(--warn); border-color:var(--warn); }
+  .grid { display:grid; grid-template-columns: 1.5fr 1fr; gap:14px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px 14px; margin-bottom:14px; }
+  .panel h2 { margin:0 0 10px; font-size:11px; letter-spacing:.07em; text-transform:uppercase; color:var(--dim); }
+  button { background:none; border:1px solid var(--border); color:var(--fg); padding:5px 12px; border-radius:8px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--accent); color:var(--accent); }
+  button.pri { background:var(--accent); border-color:var(--accent); color:#0e1116; font-weight:650; }
+  button.danger:hover { border-color:var(--err); color:var(--err); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .vms { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .vm { border:1px solid var(--border); border-radius:10px; padding:9px 11px; }
+  .vm .hd { display:flex; justify-content:space-between; align-items:center; }
+  .vm b { font-size:13px; }
+  .chip { font-size:10px; padding:1px 8px; border-radius:99px; border:1px solid var(--border); color:var(--dim); white-space:nowrap; }
+  .chip.Ready { color:var(--ok); border-color:var(--ok); }
+  .chip.Installing { color:var(--warn); border-color:var(--warn); }
+  .vm .meta { color:var(--dim); font-size:11px; margin:6px 0; }
+  .vm .acts { display:flex; gap:6px; flex-wrap:wrap; }
+  .vm .acts button { padding:2px 8px; font-size:11px; }
+  .empty { color:var(--dim); border:1px dashed var(--border); border-radius:10px; padding:16px; text-align:center; }
+  .log { height:230px; overflow-y:auto; font-family:ui-monospace,Consolas,monospace; font-size:11px;
+         background:#0d1117; border-radius:8px; padding:8px; }
+  .log .t { color:var(--dim); } .log .tool { color:var(--accent); }
+  .log .ok { color:var(--ok); } .log .err { color:var(--err); } .log .warn { color:var(--warn); }
+  .con { height:200px; overflow-y:auto; background:#0d1117; border-radius:8px; padding:8px;
+         font-family:ui-monospace,Consolas,monospace; font-size:11px; white-space:pre-wrap; margin-bottom:8px; }
+  .row { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; align-items:center; }
+  input, select { background:#0d1117; border:1px solid var(--border); color:var(--fg); border-radius:8px; padding:5px 9px; font:inherit; }
+  input:focus { outline:none; border-color:var(--accent); }
+  .flabel { color:var(--dim); font-size:11px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:12px; }
+  .kv b { font-weight:600; } .kv span.ok { color:var(--ok); } .kv span.err { color:var(--err); } .kv span.warn { color:var(--warn); }
+  .banner { border:1px solid var(--warn); color:var(--warn); border-radius:10px; padding:8px 12px; margin-bottom:14px; display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>hyperv-sandbox</h1>
+  <span class="pill" id="conn">connecting…</span>
+  <span class="pill" id="vmmsPill">VMMS …</span>
+  <span class="pill" id="taskPill">task …</span>
+  <span style="flex:1"></span>
+  <span class="pill">backend = HermesHyperV service · MCP on /mcp</span>
+</header>
+<div class="banner" id="rebootBanner">⚠ Hyper-V role is enabled but the hypervisor loads only at boot — <b>one reboot needed</b> before VMs work. Everything else is live.</div>
+
+<div class="grid">
+  <div>
+    <div class="panel">
+      <h2>Sandbox VMs · C:\HyperV\VMs</h2>
+      <div class="row">
+        <button class="pri" onclick="createVM()">＋ create_vm</button>
+        <span class="flabel">name</span><input id="nm" placeholder="auto" style="width:110px">
+        <span class="flabel">MB</span><input id="mem" value="4096" style="width:64px">
+        <span class="flabel">vCPU</span><input id="cpu" value="2" style="width:48px">
+        <span class="flabel">disk GB</span><input id="disk" value="64" style="width:52px">
+        <button class="danger" onclick="purge()">purge_all</button>
+      </div>
+      <div class="vms" id="vms"><div class="empty">loading…</div></div>
+    </div>
+    <div class="panel">
+      <h2>run_ps — PowerShell Direct into guest</h2>
+      <div class="con" id="con">pick a Ready VM, type a command →</div>
+      <div class="row">
+        <select id="vsel"></select>
+        <input id="cmd" style="flex:1" placeholder="Get-ComputerInfo | Select OsName, OsVersion"
+               onkeydown="if(event.key==='Enter')runCmd()">
+        <button onclick="runCmd()">run</button>
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="panel">
+      <h2>Host readiness</h2>
+      <div class="kv" id="host">—</div>
+    </div>
+    <div class="panel">
+      <h2>Activity (real tool calls)</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+</div>
+</div>
+<script>
+var logN = 0, jobs = {}, vmCache = [];
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function jget(u){ return fetch(u).then(r=>r.json()); }
+function jpost(u,b){ return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json()); }
+
+function pollLog(){
+  jget('/api/log?since='+logN).then(d=>{
+    var l=document.getElementById('log');
+    d.log.forEach(function(x){ logN=x.n;
+      l.innerHTML += '<div><span class="t">['+x.t+']</span> <span class="'+x.k+'">'+esc(x.m)+'</span></div>'; });
+    l.scrollTop=l.scrollHeight;
+  }).catch(function(){});
+}
+function pollStatus(){
+  jget('/api/status').then(d=>{
+    document.getElementById('conn').textContent='live';
+    document.getElementById('conn').className='pill live';
+    if(!d.ok) return;
+    var s=d.data;
+    var vp=document.getElementById('vmmsPill');
+    vp.textContent='VMMS '+(s.vmms_running?'running':s.needs_reboot?'pending reboot':s.vmms_service);
+    vp.className='pill '+(s.vmms_running?'live':'warn');
+    var tp=document.getElementById('taskPill');
+    tp.textContent='elev-task '+s.elevation_task; tp.className='pill '+(s.elevation_task==='present'?'live':'warn');
+    document.getElementById('rebootBanner').style.display=s.needs_reboot?'block':'none';
+    document.getElementById('host').innerHTML =
+      '<b>hypervisor</b><span class="'+(s.hypervisor_present?'ok':'err')+'">'+(s.hypervisor_present?'present':'absent')+'</span>'+
+      '<b>VMMS service</b><span class="'+(s.vmms_running?'ok':'warn')+'">'+esc(s.vmms_service)+'</span>'+
+      '<b>elevation task</b><span class="'+(s.elevation_task==='present'?'ok':'warn')+'">'+esc(s.elevation_task)+'</span>'+
+      '<b>free disk</b><span>'+(Object.values(s.disks)[0]||{}).free_gb+' GB</span>'+
+      '<b>ISOs</b><span>'+(s.isos.length? s.isos.map(x=>esc(x.slice(0,40))).join('<br>') :'<span class=warn>none</span>')+'</span>'+
+      '<b>iso jobs</b><span>'+ (Object.keys(s.iso_jobs||{}).length? esc(JSON.stringify(s.iso_jobs)) : '—') +'</span>';
+  }).catch(function(){ document.getElementById('conn').textContent='server down'; document.getElementById('conn').className='pill warn'; });
+}
+function renderVMs(data){
+  vmCache = data.vms||[];
+  var w=document.getElementById('vms');
+  if(!vmCache.length){ w.innerHTML='<div class="empty">No sandbox VMs. <b>create_vm</b> → unattended install → disposable guest.</div>'; }
+  else w.innerHTML=vmCache.map(function(v){
+    var ready=v.phase==='Ready';
+    return '<div class="vm"><div class="hd"><b>'+esc(v.name)+'</b><span class="chip '+v.phase+'">'+esc(v.state==='Running'?(v.ips.length?'Ready · Running':'installing…'):v.state)+'</span></div>'+
+      '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(v.ips.length?esc(v.ips[0]):'no IP yet (installing / network idle)')+'</div>'+
+      '<div class="acts"><button '+(ready?'':'disabled ')+'onclick="pick(\''+esc(v.name)+'\')">run_ps</button>'+
+      '<button '+(v.state==='Running'?'':'disabled ')+'onclick="act(\'/api/start\',\''+esc(v.name)+'\')" '+(v.state==='Running'?'style=display:none':'')+'>start</button>'+
+      '<button '+(v.state==='Running'?'':'disabled ')+'onclick="act(\'/api/stop\',\''+esc(v.name)+'\')" '+(v.state!=='Running'?'style=display:none':'')+'>stop</button>'+
+      '<button class="danger" onclick="act(\'/api/delete\',\''+esc(v.name)+'\')">delete</button></div></div>';
+  }).join('');
+  var sel=document.getElementById('vsel');
+  var ready=vmCache.filter(v=>v.phase==='Ready').map(v=>v.name);
+  var cur=sel.value;
+  sel.innerHTML=ready.length?ready.map(n=>'<option>'+esc(n)+'</option>').join(''):'<option value="">— no Ready VM —</option>';
+  if(ready.indexOf(cur)>=0) sel.value=cur;
+}
+function pollVMs(){ jget('/api/vms').then(d=>{ if(d.ok) renderVMs(d.data); }).catch(function(){}); }
+function pollJobs(){
+  jget('/api/jobs').then(d=>{
+    d.jobs.forEach(function(j){
+      if(jobs[j.id]===undefined && j.status!=='running'){
+        jobs[j.id]=true;
+        if(j.name==='run_ps' && j.result){
+          var c=document.getElementById('con');
+          c.innerHTML += '\n' + esc(j.result.output||'(no output)') + (j.result.timed_out?'\n[timed out]':'');
+          c.scrollTop=c.scrollHeight;
+        }
+      }
+    });
+  }).catch(function(){});
+}
+function createVM(){
+  var b={ name:document.getElementById('nm').value||undefined,
+          memory_mb:+document.getElementById('mem').value||4096,
+          cpu:+document.getElementById('cpu').value||2,
+          disk_gb:+document.getElementById('disk').value||64 };
+  jpost('/api/create',b); setTimeout(pollVMs,1500);
+}
+function act(u,name){ jpost(u,{name:name}); setTimeout(pollVMs,1200); setTimeout(pollVMs,5000); }
+function purge(){ if(confirm('Destroy ALL tagged sandbox VMs and their files?')){ jpost('/api/purge',{}); setTimeout(pollVMs,2000);} }
+function pick(n){ document.getElementById('vsel').value=n; document.getElementById('cmd').focus(); }
+function runCmd(){
+  var n=document.getElementById('vsel').value, c=document.getElementById('cmd').value.trim();
+  if(!n||!c) return;
+  var con=document.getElementById('con');
+  con.innerHTML += '\n\n\u001b[0mPS C:\\Users\\Sandbox&gt; '+esc(c)+'   ['+esc(n)+']';
+  document.getElementById('cmd').value='';
+  jpost('/api/run',{name:n,cmd:c});
+  con.scrollTop=con.scrollHeight;
+}
+setInterval(pollLog,1500); setInterval(pollStatus,10000); setInterval(pollVMs,6000); setInterval(pollJobs,1800);
+pollStatus(); pollVMs(); pollLog();
+</script>
+</body>
+</html>
