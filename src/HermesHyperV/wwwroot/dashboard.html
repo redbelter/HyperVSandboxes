@@ -224,7 +224,7 @@ function runCmd(){
   var n=document.getElementById('vsel').value, c=document.getElementById('cmd').value.trim();
   if(!n||!c) return;
   var v=vmCache.find(x=>x.name===n)||{};
-  var prompt = v.linux ? 'sandbox@'+esc(n.replace(/^mcp-',''))+':~$' : 'PS C:\\Users\\Sandbox&gt;';
+  var prompt = v.linux ? 'sandbox@'+esc(n.replace(/^mcp-/,''))+':~$ ' : 'PS C:\\Users\\Sandbox&gt; ';
   var con=document.getElementById('con');
   con.innerHTML += '\n\n<span class="pmt">'+prompt+'</span> '+esc(c)+'   <span class="dim">['+esc(n)+']</span>';
   document.getElementById('cmd').value='';
