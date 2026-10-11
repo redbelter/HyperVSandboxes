@@ -25,6 +25,7 @@ builder.Services.AddSingleton<PowerShellRunner>();
 builder.Services.AddSingleton<SandboxEngine>();
 builder.Services.AddSingleton<JobStore>();
 builder.Services.AddSingleton<VmsCache>();
+builder.Services.AddHostedService<SandboxEngine.ReadinessProber>();
 
 // MCP server over streamable HTTP at /mcp (the agent-facing control plane)
 builder.Services.AddMcpServer().WithHttpTransport().WithTools<HypervSandboxTools>();

@@ -59,6 +59,15 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
         => JsonSerializer.SerializeToElement(await engine.CreateVmAsync(
             name, iso, edition, memory_mb, max_memory_mb, cpu, disk_gb, password, ct));
 
+    [McpServerTool, Description("BLOCK until the VM's desktop is genuinely usable: polls the " +
+        "FirstLogonCommands marker until the guest has logged on to the desktop. THIS is 'the VM " +
+        "is ready' — heartbeat/state only prove the OS kernel responds; run_ps works even while " +
+        "OOBE is stalled. Call after create_vm before using a fresh VM. Returns ready_at timestamp.")]
+    public async Task<JsonElement> Wait_ready(
+        string name, CancellationToken ct,
+        [Description("max seconds to wait (default 300, max 3600)")] int timeout_s = 300)
+        => JsonSerializer.SerializeToElement(await engine.WaitReadyAsync(name, timeout_s, ct));
+
     [McpServerTool, Description("Run PowerShell INSIDE the guest over PowerShell Direct (VMBus — no network needed). Returns stdout.")]
     public Task<JsonElement> Run_ps(string name, string command, CancellationToken ct, int timeout_s = 60) =>
         engine.RunPsAsync(name, command, timeout_s, ct: ct);

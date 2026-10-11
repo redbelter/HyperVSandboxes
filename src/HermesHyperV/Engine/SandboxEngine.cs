@@ -94,7 +94,13 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     {
         var r = await ps.RunScriptAsync("vm_lifecycle", new { action = "list", tag = cfg.Tag }, 120, ct);
         if (!r.Ok) throw new InvalidOperationException(r.Error ?? "list failed");
-        return r.Data ?? [];
+        // stamp the honest phase (desktop-confirmed) onto every VM row
+        return (r.Data ?? []).Select(vm =>
+        {
+            var o = JsonSerializer.Deserialize<Dictionary<string, object?>>(vm.GetRawText())!;
+            o["phase"] = Phase(vm);
+            return JsonSerializer.SerializeToElement(o);
+        }).ToArray();
     }
 
     public static string Phase(JsonElement vm)
@@ -102,7 +108,57 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         var state = vm.TryGetProperty("state", out var s) ? s.GetString() : null;
         if (state != "Running") return "Off";
         var hb = vm.TryGetProperty("heartbeat", out var h) ? h.GetString() ?? "" : "";
-        return hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase) ? "Ready" : "Installing";
+        if (!hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase)) return "Installing";
+        // Heartbeat Ok only means the kernel/ICs respond. Honest 'Ready' =
+        // desktop actually logged on (ready.txt seen by the readiness prober).
+        var name = vm.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+        return ReadyCache.ContainsKey(name) ? "Ready" : "Installing";
+    }
+
+    /// <summary>
+    /// Polls ready.txt for every heartbeat-Ok VM, so list_vms/dashboard/
+    /// wait_ready share one honest readiness view without callers probing.
+    /// Blogs the transition so the activity feed says when a VM is truly usable.
+    /// </summary>
+    internal sealed class ReadinessProber(SandboxEngine engine, JobStore jobs,
+        ILogger<ReadinessProber> log) : BackgroundService
+    {
+        const string Probe =
+            "if (Test-Path C:\\Sandbox\\ready.txt) { Get-Content C:\\Sandbox\\ready.txt } " +
+            "else { 'NOT-YET' }";
+
+        protected override async Task ExecuteAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    foreach (var vm in await engine.ListVmsAsync(ct))
+                    {
+                        var name = vm.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                        var hb = vm.TryGetProperty("heartbeat", out var h) ? h.GetString() ?? "" : "";
+                        var st = vm.TryGetProperty("state", out var s2) ? s2.GetString() : null;
+                        if (st != "Running" || !hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        if (ReadyCache.ContainsKey(name)) continue;
+                        try
+                        {
+                            var r = await engine.RunPsAsync(name, Probe, 30, ct: ct);
+                            var outp = (r.TryGetProperty("output", out var o) ? o.GetString() : "")?.Trim() ?? "";
+                            if (outp.Length > 0 && !outp.Contains("NOT-YET"))
+                            {
+                                ReadyCache[name] = outp;
+                                jobs.Blog($"{name}: desktop ready ({outp})", "ready");
+                            }
+                        }
+                        catch { /* guest not answering yet — expected mid-boot */ }
+                    }
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex) { log.LogDebug(ex, "readiness probe cycle failed"); }
+                try { await Task.Delay(8000, ct); } catch { break; }
+            }
+        }
     }
 
     public async Task<JsonElement> VmStatusAsync(string name, CancellationToken ct = default)
@@ -132,7 +188,65 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     static readonly SemaphoreSlim GoldenGate = new(1, 1);
 
     /// <summary>
-    /// Golden images are keyed by (ISO file, edition, disk size): build once,
+    /// Desktop-readiness markers observed (vm -> ready.txt content). Sticky
+    /// per VM lifetime: once the desktop logged on, it stays usable.
+    /// </summary>
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ReadyCache = new();
+
+    /// <summary>
+    /// Block until the guest DESKTOP is actually up: polls the FirstLogonCommands
+    /// marker C:\Sandbox\ready.txt over PS Direct. Heartbeat Ok only proves the
+    /// kernel/ICs respond — PS Direct works during an OOBE stall, so this
+    /// marker is the only honest "usable" signal.
+    /// </summary>
+    public async Task<Dictionary<string, object?>> WaitReadyAsync(
+        string name, int timeoutSec = 300, CancellationToken ct = default)
+    {
+        var full = CheckName(name);
+        timeoutSec = Math.Clamp(timeoutSec, 10, 3600);
+        if (ReadyCache.TryGetValue(full, out var hot))
+            return new Dictionary<string, object?>
+            {
+                ["vm"] = full, ["ready"] = true, ["ready_at"] = hot, ["cached"] = true,
+            };
+
+        const string probe =
+            "if (Test-Path C:\\Sandbox\\ready.txt) { Get-Content C:\\Sandbox\\ready.txt } " +
+            "else { 'NOT-YET' }";
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSec);
+        string? lastState = null;
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var r = await RunPsAsync(full, probe, 40, ct: ct);
+                var outp = (r.TryGetProperty("output", out var o) ? o.GetString() : "")?.Trim() ?? "";
+                lastState = outp;
+                if (outp.Length > 0 && !outp.Contains("NOT-YET"))
+                {
+                    ReadyCache[full] = outp;
+                    return new Dictionary<string, object?>
+                    {
+                        ["vm"] = full, ["ready"] = true, ["ready_at"] = outp, ["cached"] = false,
+                    };
+                }
+                lastState = "desktop session up, marker pending";
+            }
+            catch (Exception ex)
+            {
+                // PS Direct refuses until integration components are up;
+                // that is expected while the VM is booting — keep polling.
+                lastState = ex.Message.Split('\n')[0] is var s && s.Length > 90 ? s[..90] : ex.Message;
+            }
+            await Task.Delay(5000, ct);
+        }
+        throw new TimeoutException(
+            $"guest desktop not ready within {timeoutSec}s (last: {lastState}). " +
+            "A VM stuck here past ~5 min usually means OOBE stalled — check Panther logs.");
+    }
+
+    /// <summary>Golden images are keyed by (ISO file, edition, disk size): build once,
     /// reuse forever. Differencing children reference it, so it must not move.
     /// </summary>
     string GoldenPath(string isoPath, string edition, int diskGb)
@@ -156,6 +270,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         string? password = null, CancellationToken ct = default)
     {
         var vmName = CheckName(name);
+        ReadyCache.TryRemove(vmName, out _);   // fresh VM = no stale readiness
         var path = FindIso(iso);
         IsoEntry? cat = null;
         if (edition is null)
@@ -250,19 +365,25 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     public Task<JsonElement> StopVmAsync(string name, CancellationToken ct = default) =>
         Run1("vm_lifecycle", new { action = "power", name = CheckName(name), want = "stop" }, 300, ct);
 
-    public Task<JsonElement> DeleteVmAsync(string name, CancellationToken ct = default)
+    public async Task<JsonElement> DeleteVmAsync(string name, CancellationToken ct = default)
     {
         var full = CheckName(name);
-        return Run1("vm_lifecycle", new
+        var r = await Run1("vm_lifecycle", new
         {
             action = "delete", name = full, tag = cfg.Tag,
             root = Path.Combine(VmDir, full),
             oobe = Path.Combine(MediaDir, $"{full}-oobe.xml"),
         }, 300, ct);
+        ReadyCache.TryRemove(full, out _);
+        return r;
     }
 
-    public Task<JsonElement> PurgeAsync(CancellationToken ct = default) =>
-        Run1("vm_lifecycle", new { action = "purge", tag = cfg.Tag, vmroot = VmDir, media = MediaDir }, 600, ct);
+    public async Task<JsonElement> PurgeAsync(CancellationToken ct = default)
+    {
+        var r = await Run1("vm_lifecycle", new { action = "purge", tag = cfg.Tag, vmroot = VmDir, media = MediaDir }, 600, ct);
+        ReadyCache.Clear();
+        return r;
+    }
 
     /// <summary>PowerShell Direct into the guest (VMBus — works without network).</summary>
     public async Task<JsonElement> RunPsAsync(string name, string command, int timeoutSec = 60,
@@ -293,26 +414,5 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     {
         var r = await ps.RunScriptAsync(script, req, timeout, ct);
         return r.Require();
-    }
-
-    /// <summary>Wait for heartbeat Ok (guest OS up). Cheap polling in one ps child.</summary>
-    public async Task<bool> WaitReadyAsync(string name, int timeoutSec = 900, CancellationToken ct = default)
-    {
-        var full = CheckName(name);
-        while (timeoutSec > 0)
-        {
-            var r = await ps.RunScriptAsync("vm_lifecycle", new { action = "wait", name = full, want = "Running", timeout_s = Math.Min(60, timeoutSec) }, 120, ct);
-            if (r.Ok)
-            {
-                try
-                {
-                    var st = await VmStatusAsync(full, ct);
-                    if (Phase(st) == "Ready") return true;
-                }
-                catch { }
-            }
-            timeoutSec -= 60;
-        }
-        return false;
     }
 }
