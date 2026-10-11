@@ -125,6 +125,14 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     }
 
     /// <summary>
+    /// S/W/R drive letters are a machine-global namespace, and provisioning
+    /// binds them to ITS OWN partitions. Two concurrent create_vm jobs would
+    /// collide on them (or yank W: out from under each other's dism apply),
+    /// so provisioning is a global critical section: concurrent calls queue.
+    /// </summary>
+    static readonly SemaphoreSlim ProvisionGate = new(1, 1);
+
+    /// <summary>
     /// Provision + create + start a disposable Gen-2 VM. Blocking: image
     /// apply takes ~8-12 min (runs in one hidden dism.exe). Returns once the
     /// VM is Running; guest answers run_ps ~2-4 min later (heartbeat Ok).
@@ -153,35 +161,40 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         var oobe = RenderOobe(vmName, password);
         var vroot = Path.Combine(VmDir, vmName);
 
-        log.LogInformation("provisioning {Vm} from {Iso} (~10 min, hidden dism)", vmName, Path.GetFileName(path));
-        var prov = await ps.RunScriptAsync("provision_disk", new
+        await ProvisionGate.WaitAsync(ct);
+        try
         {
-            root = vroot, iso = path, edition, unattend = oobe, disk_gb = diskGb,
-        }, 1800, ct);
-        if (!prov.Ok) throw new InvalidOperationException($"provisioning failed: {prov.Error}");
+            log.LogInformation("provisioning {Vm} from {Iso} (~10 min, hidden dism)", vmName, Path.GetFileName(path));
+            var prov = await ps.RunScriptAsync("provision_disk", new
+            {
+                root = vroot, vmroot = VmDir, iso = path, edition, unattend = oobe, disk_gb = diskGb,
+            }, 1800, ct);
+            if (!prov.Ok) throw new InvalidOperationException($"provisioning failed: {prov.Error}");
 
-        var create = await ps.RunScriptAsync("vm_lifecycle", new
-        {
-            action = "create", name = vmName, root = vroot,
-            mem_mb = memoryMb, max_mb = maxMemoryMb, cpu,
-            @switch = cfg.Switch, tag = cfg.Tag,
-        }, 300, ct);
-        var created = create.Require();
-        log.LogInformation("VM {Vm} created, state={State}", vmName,
-            created.TryGetProperty("state", out var st) ? st.GetString() : "?");
+            var create = await ps.RunScriptAsync("vm_lifecycle", new
+            {
+                action = "create", name = vmName, root = vroot,
+                mem_mb = memoryMb, max_mb = maxMemoryMb, cpu,
+                @switch = cfg.Switch, tag = cfg.Tag,
+            }, 300, ct);
+            var created = create.Require();
+            log.LogInformation("VM {Vm} created, state={State}", vmName,
+                created.TryGetProperty("state", out var st) ? st.GetString() : "?");
 
-        return new Dictionary<string, object?>
-        {
-            ["vm"] = vmName,
-            ["state"] = created.TryGetProperty("state", out var s2) ? s2.GetString() : null,
-            ["folder"] = vroot,
-            ["guest_user"] = GuestDefaults.User,
-            ["guest_password"] = password,
-            ["iso"] = path,
-            ["edition"] = edition,
-            ["note"] = "Windows pre-applied; boots into auto-OOBE. Poll vm_status — when " +
-                       "heartbeat is Ok / run_ps answers, the guest is live (~2-4 min).",
-        };
+            return new Dictionary<string, object?>
+            {
+                ["vm"] = vmName,
+                ["state"] = created.TryGetProperty("state", out var s2) ? s2.GetString() : null,
+                ["folder"] = vroot,
+                ["guest_user"] = GuestDefaults.User,
+                ["guest_password"] = password,
+                ["iso"] = path,
+                ["edition"] = edition,
+                ["note"] = "Windows pre-applied; boots into auto-OOBE. Poll vm_status — when " +
+                           "heartbeat is Ok / run_ps answers, the guest is live (~2-4 min).",
+            };
+        }
+        finally { ProvisionGate.Release(); }
     }
 
     public Task<JsonElement> PowerVmAsync(string name, string want, CancellationToken ct = default)

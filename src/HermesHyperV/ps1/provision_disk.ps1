@@ -22,9 +22,12 @@ try {
   $vhd = Join-Path $root 'disk.vhdx'
   $stg = 'root/Microsoft/Windows/Storage'
 
-  # release stale mounts/letters left by a crashed provision
+  # release stale mounts/letters left by a crashed provision (any sandbox
+  # disk under the VMs root, not just this VM's folder — a crashed sibling
+  # run can leave S:/W: bound to ITS partitions)
   step 'cleanup' {
-    foreach ($dd in @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.Location -like ($root + '*') })) {
+    $scan = [string]$req.vmroot; if (-not $scan) { $scan = $root }
+    foreach ($dd in @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.Location -like ($scan + '*') })) {
       foreach ($p in @(Get-Partition -DiskNumber $dd.Number -ErrorAction SilentlyContinue)) {
         foreach ($ap in @($p.AccessPaths)) {
           if ($ap -match '^[A-Z]:\\?$') {
