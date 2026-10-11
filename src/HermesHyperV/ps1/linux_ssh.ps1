@@ -18,35 +18,67 @@ try {
     if ($p.ExitCode -ne 0) { throw "ssh-keygen exit $($p.ExitCode)" }
   }
 
+  # Canonical CommandLineToArgvW quoting via character loop — regex -replace
+  # with backslashes drifts silently across embedding layers, this cannot.
+  function Q-Arg([string]$a) {
+    if ($a -eq '') { return '""' }
+    if ($a -notmatch '[ \t"]') { return $a }
+    $sb = New-Object Text.StringBuilder
+    [void]$sb.Append('"')
+    $bs = 0
+    foreach ($ch in $a.ToCharArray()) {
+      if ($ch -eq [char]92) { $bs++; continue }
+      if ($ch -eq [char]34) {
+        [void]$sb.Append([string][char]92 * ($bs * 2 + 1)); [void]$sb.Append([char]34)
+      } else {
+        if ($bs) { [void]$sb.Append([string][char]92 * $bs); $bs = 0 }
+        [void]$sb.Append($ch)
+      }
+    }
+    if ($bs) { [void]$sb.Append([string][char]92 * ($bs * 2)) }
+    [void]$sb.Append('"')
+    $sb.ToString()
+  }
   function Invoke-Ssh([string]$h, [string]$command, [int]$timeoutSec) {
-    $outf = Join-Path $env:TEMP ('sshsx_' + [Guid]::NewGuid().ToString('N'))
-    $errf = $outf + '.err'
-    $args = @('-i', ($key),
+    $argl = @('-i', ($key),
               '-o','BatchMode=yes',
               '-o','StrictHostKeyChecking=no',
               '-o','UserKnownHostsFile=NUL',
               '-o','ConnectTimeout=8',
               '-o','ServerAliveInterval=5','-o','ServerAliveCountMax=3',
               ('sandbox@' + $h), $command)
-    $p = Start-Process -FilePath $ssh -ArgumentList $args -NoNewWindow -PassThru `
-          -RedirectStandardOutput $outf -RedirectStandardError $errf
+    # [Diagnostics.Process], NOT Start-Process: under PS5.1 the PassThru object
+    # reports ExitCode=NULL even after WaitForExit in this host session, which
+    # silently lost the guest's real exit code. Raw Process always has it.
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $ssh
+    $psi.Arguments = (($argl | ForEach-Object { Q-Arg $_ }) -join ' ')
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = [Diagnostics.Process]::Start($psi)
+    $oTask = $proc.StandardOutput.ReadToEndAsync()
+    $eTask = $proc.StandardError.ReadToEndAsync()
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     $timedOut = $false
-    while ($true) {
-      if ($p.WaitForExit(500)) { break }
+    while (-not $proc.WaitForExit(500)) {
       if ((Get-Date) -gt $deadline) {
         $timedOut = $true
-        Stop-Process -Id $p.Id -Force -EA SilentlyContinue
-        Start-Sleep 1
+        try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
         break
       }
     }
-    # ReadAllText, NOT Get-Content: the latter's ETS note-properties make
-    # ConvertTo-Json serialize a whole provider object graph instead of a string.
-    $text = if (Test-Path $outf) { [IO.File]::ReadAllText($outf) } else { '' }
-    $errtext = if (Test-Path $errf) { (([IO.File]::ReadAllLines($errf)) -join ' ') } else { '' }
-    Remove-Item $outf, $errf -Force -EA SilentlyContinue
-    return @{ exit = $p.ExitCode; output = $text; stderr = $errtext; timed_out = $timedOut }
+    $text = ''; $errtext = ''
+    if (-not $timedOut) {
+      # [void] the Wait() bool — inside an if-block both it and Result flow on
+      # the pipeline, turning $text into an array and poisoning ConvertTo-Json.
+      $null = $oTask.Wait(3000); $text = $oTask.Result
+      $null = $eTask.Wait(3000); $errtext = $eTask.Result
+    }
+    $code = if ($timedOut) { -1 } else { try { $proc.ExitCode } catch { -1 } }
+    if ($null -eq $code) { $code = -1 }
+    return @{ exit = $code; output = $text; stderr = $errtext; timed_out = $timedOut }
   }
 
   switch ($mode) {

@@ -48,9 +48,9 @@ public static class Api
             var linux = IsoCatalog.IsLinux(iso);
             var jid = jobs.Spawn("create_vm", async ct => linux
                 ? await e.CreateLinuxVmAsync(name, iso, memoryMb: body.MemoryMb ?? 0,
-                    cpu: body.Cpu ?? 2, diskGb: body.DiskGb ?? 0, ct: ct)
+                    cpu: body.Cpu ?? 2, diskGb: body.DiskGb ?? 0, password: body.Password, ct: ct)
                 : await e.CreateVmAsync(name, iso, memoryMb: body.MemoryMb ?? 0, cpu: body.Cpu ?? 2,
-                    diskGb: body.DiskGb ?? 0, ct: ct));
+                    diskGb: body.DiskGb ?? 0, password: body.Password, ct: ct));
             return Results.Json(new { job = jid });
         });
 
@@ -139,7 +139,8 @@ public static class Api
                                    [property: System.Text.Json.Serialization.JsonPropertyName("iso")] string? Iso,
                                    [property: System.Text.Json.Serialization.JsonPropertyName("memory_mb")] int? MemoryMb,
                                    [property: System.Text.Json.Serialization.JsonPropertyName("cpu")] int? Cpu,
-                                   [property: System.Text.Json.Serialization.JsonPropertyName("disk_gb")] int? DiskGb);
+                                   [property: System.Text.Json.Serialization.JsonPropertyName("disk_gb")] int? DiskGb,
+                                   [property: System.Text.Json.Serialization.JsonPropertyName("password")] string? Password = null);
 }
 
 /// <summary>4s cache on the VM list, same as Flask's _vms_cache.</summary>

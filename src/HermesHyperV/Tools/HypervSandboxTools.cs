@@ -57,7 +57,7 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
         [Description("0 = catalog default (64)")] int disk_gb = 0,
         string? password = null)
         => JsonSerializer.SerializeToElement(IsoCatalog.IsLinux(iso)
-            ? await engine.CreateLinuxVmAsync(name, iso, memory_mb, cpu, disk_gb, ct)
+            ? await engine.CreateLinuxVmAsync(name, iso, memory_mb, cpu, disk_gb, password, ct)
             : await engine.CreateVmAsync(
                 name, iso, edition, memory_mb, max_memory_mb, cpu, disk_gb, password, ct));
 
@@ -71,7 +71,7 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
         => JsonSerializer.SerializeToElement(await engine.WaitReadyAsync(name, timeout_s, ct));
 
     [McpServerTool, Description("Run a command INSIDE the guest: PowerShell via PowerShell Direct on "
-        + "Windows VMs, bash via SSH on Linux VMs. Returns stdout.")]
+        + "Windows VMs, bash via SSH on Linux VMs. Returns stdout, stderr, exit code.")]
     public Task<JsonElement> Run_ps(string name, string command, CancellationToken ct, int timeout_s = 60) =>
         engine.RunPsAsync(name, command, timeout_s, ct: ct);
 

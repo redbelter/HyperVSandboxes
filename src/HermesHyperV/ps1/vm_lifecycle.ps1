@@ -75,6 +75,7 @@ try {
       $switch=[string]$req.switch; $tag=[string]$req.tag
       $ip=[string]$req.ip; $hostname=[string]$req.hostname
       $pubkey=[string]$req.pubkey; $diskGb=[int]$req.disk_gb
+      $pass=[string]$req.password
       if (-not (Test-Path $golden)) { throw "missing golden linux image $golden" }
       if (-not (Get-VMSwitch -Name $switch -ErrorAction SilentlyContinue)) {
         New-VMSwitch -Name $switch -SwitchType Internal | Out-Null
@@ -141,11 +142,14 @@ try {
           '    groups: [sudo]'
           '    sudo: ALL=(ALL) NOPASSWD:ALL'
           '    shell: /bin/bash'
-          '    lock_passwd: true'
+          '    lock_passwd: false'
+          '    plain_text_passwd: "PLAINTEXTPASS"'
           "    ssh_authorized_keys: [`"$pubkey`"]"
+          'ssh_pwauth: true'
           'runcmd:'
           '  - echo "ready $(date -Is)" > /var/lib/sandbox-ready && chmod 644 /var/lib/sandbox-ready'
         ) -join "`n"
+        if ($pass) { $ud = $ud.Replace('"PLAINTEXTPASS"', ('''' + $pass.Replace('''''','''''''') + '''')) } else { $ud = ($ud -split "`n" | Where-Object { $_ -notmatch 'PLAINTEXTPASS|lock_passwd' }) -join "`n" }
         $md = "instance-id: $name`nlocal-hostname: $hostname`n"
         $nc = @(
           'version: 2'

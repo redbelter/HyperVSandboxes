@@ -46,6 +46,10 @@
   .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:12px; }
   .kv b { font-weight:600; } .kv span.ok { color:var(--ok); } .kv span.err { color:var(--err); } .kv span.warn { color:var(--warn); }
   .banner { border:1px solid var(--warn); color:var(--warn); border-radius:10px; padding:8px 12px; margin-bottom:14px; display:none; }
+  .creds { font-family:ui-monospace,Consolas,monospace; font-size:11px; color:var(--dim); }
+  .creds b { color:var(--fg); cursor:pointer; }
+  .creds b:hover { color:var(--accent); }
+  .con .err { color:var(--err); } .con .dim { color:var(--dim); } .con .pmt { color:var(--ok); }
 </style>
 </head>
 <body>
@@ -138,9 +142,16 @@ function renderVMs(data){
   var w=document.getElementById('vms');
   if(!vmCache.length){ w.innerHTML='<div class="empty">No sandbox VMs. <b>create_vm</b> → unattended install → disposable guest.</div>'; }
   else w.innerHTML=vmCache.map(function(v){
-    var ready=v.phase==='Ready';
-    return '<div class="vm"><div class="hd"><b>'+esc(v.name)+'</b><span class="chip '+v.phase+'">'+esc(v.state==='Running'?(v.ips.length?'Ready · Running':'installing…'):v.state)+'</span></div>'+
-      '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(v.ips.length?esc(v.ips[0]):'no IP yet (installing / network idle)')+'</div>'+
+    var ready=v.phase==='Ready', lin=v.linux===true;
+    // phase comes from the engine (guest marker confirmed), NOT from Hyper-V's
+    // ip inventory — Linux guests never populate it (no guest agent).
+    var chipTxt = v.state!=='Running' ? v.state : (v.phase==='Ready'?'Ready':v.phase==='Off'?'Off':'installing…');
+    var ip = v.ip || (v.ips&&v.ips.length ? v.ips[0] : null);
+    var ci = vmCache.indexOf(v);
+    var creds = v.guest_user ? ('<div class="creds">login <b title="click to copy user:password" onclick="cpw('+ci+')">'+esc(v.guest_user)+(v.guest_password?' / '+esc(v.guest_password):'')+'</b>'+
+                  (lin&&ip?' · ssh '+esc(v.guest_user)+'@'+esc(ip):'')+'</div>') : '';
+    return '<div class="vm"><div class="hd"><b>'+esc(v.name)+(lin?' <span class="chip">debian</span>':'')+'</b><span class="chip '+v.phase+'">'+esc(chipTxt)+'</span></div>'+
+      '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(ip?esc(ip):(v.state==='Running'?'no IP yet (installing / network idle)':'—'))+'</div>'+creds+
       '<div class="acts"><button '+(ready?'':'disabled ')+'onclick="pick(\''+esc(v.name)+'\')">run_ps</button>'+
       '<button '+(v.state==='Running'?'':'disabled ')+'onclick="act(\'/api/start\',\''+esc(v.name)+'\')" '+(v.state==='Running'?'style=display:none':'')+'>start</button>'+
       '<button '+(v.state==='Running'?'':'disabled ')+'onclick="act(\'/api/stop\',\''+esc(v.name)+'\')" '+(v.state!=='Running'?'style=display:none':'')+'>stop</button>'+
@@ -158,9 +169,17 @@ function pollJobs(){
     d.jobs.forEach(function(j){
       if(jobs[j.id]===undefined && j.status!=='running'){
         jobs[j.id]=true;
-        if(j.name==='run_ps' && j.result){
+        if(j.name==='run_ps'){
           var c=document.getElementById('con');
-          c.innerHTML += '\n' + esc(j.result.output||'(no output)') + (j.result.timed_out?'\n[timed out]':'');
+          if(j.status==='error'){ c.innerHTML += '\n<span class="err">[error] '+esc(j.error||'failed')+'</span>'; }
+          else if(j.result){
+            var r=j.result;
+            if(r.output) c.innerHTML += '\n'+esc(r.output.replace(/\n+$/,''));
+            else if((r.exit||0)===0) c.innerHTML += '\n<span class="dim">(no output — exit 0)</span>';
+            if(r.stderr) c.innerHTML += '\n<span class="err">stderr: '+esc(r.stderr.replace(/\n+$/,''))+'</span>';
+            if(r.exit) c.innerHTML += '\n<span class="err">[exit '+r.exit+']</span>';
+            if(r.timed_out) c.innerHTML += '\n<span class="err">[timed out]</span>';
+          }
           c.scrollTop=c.scrollHeight;
         }
       }
@@ -195,11 +214,19 @@ function createVM(){
 function act(u,name){ jpost(u,{name:name}); setTimeout(pollVMs,1200); setTimeout(pollVMs,5000); }
 function purge(){ if(confirm('Destroy ALL tagged sandbox VMs and their files?')){ jpost('/api/purge',{}); setTimeout(pollVMs,2000);} }
 function pick(n){ document.getElementById('vsel').value=n; document.getElementById('cmd').focus(); }
+function cpw(i){
+  var v=vmCache[i]; if(!v) return;
+  navigator.clipboard.writeText(v.guest_user+':'+(v.guest_password||''));
+  var c=document.getElementById('con');
+  c.innerHTML += '<div class="dim">copied ' + esc(v.guest_user) + ' credentials to clipboard</div>';
+}
 function runCmd(){
   var n=document.getElementById('vsel').value, c=document.getElementById('cmd').value.trim();
   if(!n||!c) return;
+  var v=vmCache.find(x=>x.name===n)||{};
+  var prompt = v.linux ? 'sandbox@'+esc(n.replace(/^mcp-',''))+':~$' : 'PS C:\\Users\\Sandbox&gt;';
   var con=document.getElementById('con');
-  con.innerHTML += '\n\n\u001b[0mPS C:\\Users\\Sandbox&gt; '+esc(c)+'   ['+esc(n)+']';
+  con.innerHTML += '\n\n<span class="pmt">'+prompt+'</span> '+esc(c)+'   <span class="dim">['+esc(n)+']</span>';
   document.getElementById('cmd').value='';
   jpost('/api/run',{name:n,cmd:c});
   con.scrollTop=con.scrollHeight;

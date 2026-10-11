@@ -17,6 +17,23 @@ public sealed record SandboxSettings(string Root = @"C:\HyperV",
 public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILogger<SandboxEngine> log)
 {
     public string VmDir => Path.Combine(cfg.Root, "VMs");
+
+    /// <summary>Records the guest creds beside the VM (creds.json). Delete wipes
+    /// the whole folder, so nothing lingers. Dashboard surface only — the API
+    /// binds loopback; anyone with dashboard access can already run_ps as root.</summary>
+    void WriteCreds(string vmName, string user, string password, string? ip = null)
+    {
+        try
+        {
+            var dir = Path.Combine(VmDir, vmName);
+            Directory.CreateDirectory(dir);
+            var o = new Dictionary<string, object?> { ["user"] = user, ["password"] = password };
+            if (ip != null) o["ip"] = ip;
+            File.WriteAllText(Path.Combine(dir, "creds.json"),
+                JsonSerializer.Serialize(o));
+        }
+        catch { /* cosmetic; create must not fail over it */ }
+    }
     public string MediaDir => Path.Combine(cfg.Root, "Media");
 
     static readonly Regex NameRe = new(@"^[A-Za-z0-9][A-Za-z0-9_-]{0,30}$", RegexOptions.Compiled);
@@ -107,6 +124,18 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         {
             var o = JsonSerializer.Deserialize<Dictionary<string, object?>>(vm.GetRawText())!;
             o["phase"] = Phase(vm);
+            var nm = vm.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+            var credFile = Path.Combine(VmDir, nm, "creds.json");
+            if (nm.Length > 0 && File.Exists(credFile))
+            {
+                try
+                {
+                    using var cd = JsonDocument.Parse(File.ReadAllText(credFile));
+                    if (cd.RootElement.TryGetProperty("user", out var cu)) o["guest_user"] = cu.GetString();
+                    if (cd.RootElement.TryGetProperty("password", out var cp)) o["guest_password"] = cp.GetString();
+                }
+                catch { }
+            }
             return JsonSerializer.SerializeToElement(o);
         }).ToArray();
     }
@@ -354,6 +383,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             log.LogInformation("VM {Vm} created, state={State}", vmName,
                 created.TryGetProperty("state", out var st) ? st.GetString() : "?");
 
+            WriteCreds(vmName, GuestDefaults.User, password);
             return new Dictionary<string, object?>
             {
                 ["vm"] = vmName,
@@ -422,7 +452,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     /// </summary>
     public async Task<Dictionary<string, object?>> CreateLinuxVmAsync(
         string name, string iso, int memoryMb = 0, int cpu = 2, int diskGb = 0,
-        CancellationToken ct = default)
+        string? password = null, CancellationToken ct = default)
     {
         var vmName = CheckName(name);
         ReadyCache.TryRemove(vmName, out _);
@@ -458,6 +488,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             finally { GoldenGate.Release(); }
         }
 
+        password = string.IsNullOrWhiteSpace(password) ? GuestDefaults.Password : password;
         var ip = ClaimIp(vmName);
         var pubkey = await LinuxHostKeyAsync(ct);
         var hostname = new string(VmRef(vmName).Where(c => char.IsAsciiLetterOrDigit(c) || c == '-').ToArray());
@@ -471,9 +502,10 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             action = "linux_create", name = vmName, root = Path.Combine(VmDir, vmName),
             golden, mem_mb = memoryMb, cpu, disk_gb = diskGb,
             @switch = cfg.Switch, tag = cfg.Tag,
-            ip, hostname, pubkey,
+            ip, hostname, pubkey, password,
         }, 600, ct);
         var created = create.Require();
+        WriteCreds(vmName, cat.User, password, ip);
 
         return new Dictionary<string, object?>
         {
@@ -481,9 +513,12 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             ["state"] = created.TryGetProperty("state", out var s2) ? s2.GetString() : null,
             ["ip"] = ip,
             ["guest_user"] = cat.User,
+            ["guest_password"] = password,
+            ["auth"] = $"ssh key (service-managed) + password; ssh {cat.User}@{ip} or console",
             ["folder"] = Path.Combine(VmDir, vmName),
             ["note"] = $"Debian boots with cloud-init; first boot ~1 min. Then run_ps '{name}' runs " +
-                       "shell over SSH as " + cat.User + ". wait_ready confirms /var/lib/sandbox-ready.",
+                       "shell over SSH as " + cat.User + " (bash, NOT PowerShell). " +
+                       "wait_ready confirms /var/lib/sandbox-ready.",
         };
     }
 
@@ -508,8 +543,18 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         if (!first.TryGetProperty("output", out _) &&
             first.TryGetProperty("result", out var nested)) node = nested;
         var outp = node.TryGetProperty("output", out var o) ? o.GetString() : null;
+        var errp = node.TryGetProperty("stderr", out var er) ? er.GetString() : null;
+        // ssh prints host-key warnings on stderr on the first connect — not an error
+        if (errp != null && errp.Replace("\n", "").Replace("\r", "").Trim()
+                .StartsWith("Warning: Permanently added", StringComparison.OrdinalIgnoreCase))
+            errp = errp.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                       .Where(l => !l.TrimStart().StartsWith("Warning: Permanently added"))
+                       .DefaultIfEmpty("").Aggregate((a, b) => a + "\n" + b);
         var timedOut = node.TryGetProperty("timed_out", out var t) && t.ValueKind == JsonValueKind.True;
-        return JsonSerializer.SerializeToElement(new { vm = full, ip, output = outp, timed_out = timedOut });
+        var exit = node.TryGetProperty("exit", out var ex) && ex.ValueKind == JsonValueKind.Number && ex.TryGetInt32(out var ei) ? ei : (int?)null;
+        return JsonSerializer.SerializeToElement(new
+        { vm = full, ip, output = outp, stderr = string.IsNullOrWhiteSpace(errp) ? null : errp,
+          exit, timed_out = timedOut });
     }
 
     public Task<JsonElement> PowerVmAsync(string name, string want, CancellationToken ct = default)
