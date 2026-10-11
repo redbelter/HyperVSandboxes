@@ -45,7 +45,8 @@ internal static class GuestDefaults
     }
 }
 
-internal sealed record IsoEntry(string File, string Edition, int MemoryMb, int DiskGb, string Label);
+internal sealed record IsoEntry(string File, string Edition, int MemoryMb, int DiskGb, string Label,
+                                string Raw = "", string User = "Sandbox");
 
 internal static class IsoCatalog
 {
@@ -63,7 +64,17 @@ internal static class IsoCatalog
             "26300.9457.260913-1737.26h2_ge_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso",
             "Windows 11 Enterprise Evaluation", 8192, 64,
             "Windows 11 Enterprise"),
+        // Debian 13 (trixie) generic cloud image. 'Raw' marks it a Linux SKU:
+        // no ISO, no Panther — a raw disk image + cloud-init NoCloud seed +
+        // SSH instead. Download from
+        // https://cloud.debian.org/images/cloud/trixie/latest/
+        ["debian-13"] = new(
+            "", "Debian 13 (trixie) genericcloud", 2048, 64,
+            "Debian 13", "debian-13-generic-amd64.raw", "sandbox"),
     };
+
+    public static bool IsLinux(string key) =>
+        Entries.TryGetValue(key, out var e) && e.Raw.Length > 0;
 }
 
 internal static class Oobe

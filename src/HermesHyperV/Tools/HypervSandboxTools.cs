@@ -52,12 +52,14 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
         string name, CancellationToken ct,
         [Description("catalog name 'server2025-eval' | 'win11ent-26h2', file name in C:\\HyperV\\Media, or absolute path")] string iso = "server2025-eval",
         string? edition = null,
-        [Description("0 = per-SKU default (Server 4096, Win11 8192)")] int memory_mb = 0,
+        [Description("0 = per-SKU default (Server 4096, Win11 8192, Debian 2048)")] int memory_mb = 0,
         int max_memory_mb = 0, int cpu = 2,
         [Description("0 = catalog default (64)")] int disk_gb = 0,
         string? password = null)
-        => JsonSerializer.SerializeToElement(await engine.CreateVmAsync(
-            name, iso, edition, memory_mb, max_memory_mb, cpu, disk_gb, password, ct));
+        => JsonSerializer.SerializeToElement(IsoCatalog.IsLinux(iso)
+            ? await engine.CreateLinuxVmAsync(name, iso, memory_mb, cpu, disk_gb, ct)
+            : await engine.CreateVmAsync(
+                name, iso, edition, memory_mb, max_memory_mb, cpu, disk_gb, password, ct));
 
     [McpServerTool, Description("BLOCK until the VM's desktop is genuinely usable: polls the " +
         "FirstLogonCommands marker until the guest has logged on to the desktop. THIS is 'the VM " +
@@ -68,7 +70,8 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
         [Description("max seconds to wait (default 300, max 3600)")] int timeout_s = 300)
         => JsonSerializer.SerializeToElement(await engine.WaitReadyAsync(name, timeout_s, ct));
 
-    [McpServerTool, Description("Run PowerShell INSIDE the guest over PowerShell Direct (VMBus — no network needed). Returns stdout.")]
+    [McpServerTool, Description("Run a command INSIDE the guest: PowerShell via PowerShell Direct on "
+        + "Windows VMs, bash via SSH on Linux VMs. Returns stdout.")]
     public Task<JsonElement> Run_ps(string name, string command, CancellationToken ct, int timeout_s = 60) =>
         engine.RunPsAsync(name, command, timeout_s, ct: ct);
 

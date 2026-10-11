@@ -45,9 +45,12 @@ public static class Api
                 : body.Name!.Trim();
             var iso = string.IsNullOrWhiteSpace(body.Iso) ? "server2025-eval" : body.Iso!.Trim();
             jobs.Blog($"create_vm(name=\"{name}\", iso=\"{iso}\")", "tool");
-            var jid = jobs.Spawn("create_vm", async ct => await e.CreateVmAsync(
-                name, iso, memoryMb: body.MemoryMb ?? 0, cpu: body.Cpu ?? 2,
-                diskGb: body.DiskGb ?? 0, ct: ct));
+            var linux = IsoCatalog.IsLinux(iso);
+            var jid = jobs.Spawn("create_vm", async ct => linux
+                ? await e.CreateLinuxVmAsync(name, iso, memoryMb: body.MemoryMb ?? 0,
+                    cpu: body.Cpu ?? 2, diskGb: body.DiskGb ?? 0, ct: ct)
+                : await e.CreateVmAsync(name, iso, memoryMb: body.MemoryMb ?? 0, cpu: body.Cpu ?? 2,
+                    diskGb: body.DiskGb ?? 0, ct: ct));
             return Results.Json(new { job = jid });
         });
 
@@ -98,9 +101,7 @@ public static class Api
                     edition = kv.Value.Edition,
                     memory_mb = kv.Value.MemoryMb,
                     disk_gb = kv.Value.DiskGb,
-                    present = File.Exists(Path.Combine(
-                        Environment.GetEnvironmentVariable("HYPERV_ROOT") ?? @"C:\HyperV",
-                        "Media", kv.Value.File)),
+                    present = EntryPresent(kv.Value),
                 }).ToList(),
             },
         }));
@@ -112,6 +113,15 @@ public static class Api
         });
 
         return app;
+    }
+
+    static bool EntryPresent(IsoEntry e)
+    {
+        var media = Path.Combine(
+            Environment.GetEnvironmentVariable("HYPERV_ROOT") ?? @"C:\HyperV", "Media");
+        return e.Raw.Length > 0
+            ? File.Exists(Path.Combine(media, e.Raw))
+            : File.Exists(Path.Combine(media, e.File));
     }
 
     static JsonElement AddPhase(JsonElement vm)

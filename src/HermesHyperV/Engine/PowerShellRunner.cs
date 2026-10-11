@@ -27,17 +27,22 @@ public sealed class PowerShellRunner(ILogger<PowerShellRunner> log)
     {
         var body = ResourceScripts.Get(resourceName);
         var reqB64 = request is null ? "" : Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(request)));
+        var script = $"$env:HV_REQ='{reqB64}'\n{body}";
 
-        var psi = new ProcessStartInfo
+        ProcessStartInfo psi;
+        string? tmpFile = null;
+        // -EncodedCommand dies past ~32 KB of command line (vm_lifecycle.ps1 is
+        // right at the limit). Fall back to a temp -File for big payloads.
+        if (Encode(script).Length + 80 < 28000)
         {
-            FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe"),
-            Arguments = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {Encode($"$env:HV_REQ='{reqB64}'\n{body}")}",
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            StandardOutputEncoding = Encoding.UTF8,
-        };
+            psi = BasePsi($"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {Encode(script)}");
+        }
+        else
+        {
+            tmpFile = Path.Combine(Path.GetTempPath(), $"hvsvc_{Guid.NewGuid():N}.ps1");
+            await File.WriteAllTextAsync(tmpFile, script, new UTF8Encoding(true), ct);
+            psi = BasePsi($"-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{tmpFile}\"");
+        }
 
         var sw = Stopwatch.StartNew();
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("powershell.exe failed to start");
@@ -56,6 +61,7 @@ public sealed class PowerShellRunner(ILogger<PowerShellRunner> log)
             return new PsResult(false, null, $"powershell timed out after {timeoutSeconds}s");
         }
 
+        if (tmpFile is not null) { try { File.Delete(tmpFile); } catch { } }
         var stdout = await stdoutTask;
         var stderr = await stderrTask;
         var json = ExtractJson(stdout);
@@ -99,6 +105,17 @@ public sealed class PowerShellRunner(ILogger<PowerShellRunner> log)
         }
         return end < 0 ? null : best.Substring(0, end + 1);
     }
+
+    static ProcessStartInfo BasePsi(string args) => new()
+    {
+        FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe"),
+        Arguments = args,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+        CreateNoWindow = true,
+        StandardOutputEncoding = Encoding.UTF8,
+    };
 
     static string Encode(string script) => Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
     static string Truncate(string s, int n) => s.Length <= n ? s : s[..n] + "…";

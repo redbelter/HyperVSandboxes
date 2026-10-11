@@ -65,6 +65,121 @@ try {
       emit @{ name=$name; state=[string](Get-VM -Name $name).State; folder=$root; vhd=$vhd }
     }
 
+    # Linux: golden child vhd + NoCloud seed disk (FAT volume labelled
+    # 'cidata' holding user-data/meta-data/network-config) + static IP on the
+    # internal switch; SecureBoot off; boot disk-first. One self-contained
+    # action: child -> VM -> NIC (read MAC) -> seed (needs MAC) -> start.
+    'linux_create' {
+      $name=[string]$req.name; $root=[string]$req.root
+      $golden=[string]$req.golden; $memMb=[int]$req.mem_mb; $cpu=[int]$req.cpu
+      $switch=[string]$req.switch; $tag=[string]$req.tag
+      $ip=[string]$req.ip; $hostname=[string]$req.hostname
+      $pubkey=[string]$req.pubkey; $diskGb=[int]$req.disk_gb
+      if (-not (Test-Path $golden)) { throw "missing golden linux image $golden" }
+      if (-not (Get-VMSwitch -Name $switch -ErrorAction SilentlyContinue)) {
+        New-VMSwitch -Name $switch -SwitchType Internal | Out-Null
+      }
+      # host needs an IP on the internal LAN to ssh into guests. NB: the
+      # ManagementOS adapter's Name is 'SandboxLAN' but the NetAdapter's Name
+      # is 'vEthernet (SandboxLAN)' — match on THAT, not DeviceName.
+      $nadap = Get-VMNetworkAdapter -ManagementOS -Name $switch -EA SilentlyContinue
+      if ($nadap) {
+        $ifn = (Get-NetAdapter | Where-Object { $_.Name -eq ('vEthernet (' + $switch + ')') } | Select-Object -First 1).Name
+        if ($ifn -and -not (Get-NetIPAddress -InterfaceAlias $ifn -IPAddress 192.168.50.1 -EA SilentlyContinue)) {
+          New-NetIPAddress -InterfaceAlias $ifn -IPAddress 192.168.50.1 -PrefixLength 24 `
+            -AddressFamily IPv4 -EA SilentlyContinue | Out-Null
+        }
+      }
+      $vhd = Join-Path $root 'disk.vhdx'   # Gen-2 requires VHDX
+      $seed = Join-Path $root 'seed.vhdx'
+      if (Test-Path $root) {
+        Stop-VM -Name $name -TurnOff -Force -EA SilentlyContinue
+        Remove-VM -Name $name -Force -EA SilentlyContinue
+        Start-Sleep 1
+        Remove-Item $root -Recurse -Force -EA SilentlyContinue
+      }
+      New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+      # child (VHD differencing children MUST match the parent size exactly —
+      # Hyper-V rejects any -SizeBytes other than the parent's)
+        New-VHD -Path $vhd -ParentPath $golden -Differencing | Out-Null
+        if (-not (Test-Path $vhd)) { throw "child vhd not created" }
+      $vm = $null
+      # newvm
+        $vm = New-VM -Name $name -MemoryStartupBytes ($memMb * 1MB) -VHDPath $vhd -Generation 2 -Path $root
+        Connect-VMNetworkAdapter -VMName $name -SwitchName $switch
+        Set-VMProcessor -VM $vm -Count $cpu
+        Set-VMFirmware -VM $vm -EnableSecureBoot Off
+        Set-VM -VM $vm -Notes $tag
+      # mac
+        # The adapter's MacAddress reads 00:00:00:00:00:00 until Hyper-V
+        # commits the pool MAC at first start; the pool is deterministic
+        # (00:15:5D + last 3 bytes of the VM guid), so compute it.
+        $vg = [Guid](Get-VM -Name $name | Select-Object -Expand Id)
+        $vb = $vg.ToByteArray()
+        $script:mac = ('00155D{0:X2}{1:X2}{2:X2}' -f $vb[13], $vb[14], $vb[15]).ToLower()
+        $macFmt = ($script:mac -replace '(..)(?!$)', '$1:')
+      # seed
+        if (Test-Path $seed) { Remove-Item $seed -Force }
+        New-VHD -Path $seed -SizeBytes 64MB -Fixed | Out-Null
+        $pre = @(Get-Disk | ForEach-Object { $_.Number })
+        Mount-VHD -Path $seed | Out-Null; Start-Sleep 1
+        $d = @(Get-Disk | Where-Object { $pre -notcontains $_.Number })[0].Number
+        Initialize-Disk -Number $d -PartitionStyle MBR | Out-Null
+        $p = New-Partition -DiskNumber $d -UseMaximumSize
+        Format-Volume -Partition $p -FileSystem FAT -NewFileSystemLabel 'cidata' -Confirm:$false | Out-Null
+        $m = Join-Path $root 'seedmnt'
+        New-Item -ItemType Directory -Force -Path $m | Out-Null
+        Add-PartitionAccessPath -DiskNumber $d -PartitionNumber $p.PartitionNumber -AccessPath ($m + '\')
+        $enc = New-Object System.Text.UTF8Encoding($false)
+        $ud = @(
+          '#cloud-config'
+          "hostname: $hostname"
+          'manage_etc_hosts: true'
+          'users:'
+          '  - name: sandbox'
+          '    groups: [sudo]'
+          '    sudo: ALL=(ALL) NOPASSWD:ALL'
+          '    shell: /bin/bash'
+          '    lock_passwd: true'
+          "    ssh_authorized_keys: [`"$pubkey`"]"
+          'runcmd:'
+          '  - echo "ready $(date -Is)" > /var/lib/sandbox-ready && chmod 644 /var/lib/sandbox-ready'
+        ) -join "`n"
+        $md = "instance-id: $name`nlocal-hostname: $hostname`n"
+        $nc = @(
+          'version: 2'
+          'ethernets:'
+          '  primary:'
+          '    match:'
+          "      name: 'en*'"
+          '    set-name: eth0'
+          '    dhcp4: false'
+          "    addresses: [`"$ip/24`"]"
+          '    routes:'
+          '      - to: default'
+          '        via: 192.168.50.1'
+        ) -join "`n"
+        [IO.File]::WriteAllText((Join-Path $m 'user-data'), $ud, $enc)
+        [IO.File]::WriteAllText((Join-Path $m 'meta-data'), $md, $enc)
+        [IO.File]::WriteAllText((Join-Path $m 'network-config'), $nc, $enc)
+        Start-Sleep 1
+        Remove-PartitionAccessPath -DiskNumber $d -PartitionNumber $p.PartitionNumber -AccessPath ($m + '\')
+        Dismount-VHD -Path $seed
+        Remove-Item $m -Recurse -Force -EA SilentlyContinue
+      # boot: seed rides along as a second SCSI disk (NoCloud scans every
+      # block device for a 'cidata' volume; a DVD slot would reject vhdx media)
+        Add-VMHardDiskDrive -VMName $name -Path $seed | Out-Null
+        $hdd = @(Get-VMHardDiskDrive -VMName $name)[0]
+        Set-VMFirmware -VM $vm -BootOrder @($hdd)
+        # serial console on COM1 -> named pipe (host-side debugging, no windows)
+        Set-VMComPort -VMName $name -Number 1 -Path ('\\.\pipe\' + $name + 'com1') -EA SilentlyContinue | Out-Null
+        [IO.File]::WriteAllText((Join-Path $root 'meta.json'),
+          ('{"linux":true,"ip":"' + $ip + '"}'), (New-Object Text.UTF8Encoding($false)))
+        Start-VM -VM $vm
+        emit @{ name=$name; state=[string](Get-VM -Name $name).State; ip=$ip; mac=$script:mac; folder=$root }
+    }
+
     'power' {
       $name=[string]$req.name; $want=[string]$req.want
       $vm = Get-VM -Name $name -ErrorAction SilentlyContinue
@@ -129,13 +244,22 @@ try {
     }
 
     'list' {
-      $tag = [string]$req.tag
+      $tag = [string]$req.tag; $vmroot = [string]$req.vmroot
       Get-VM -ErrorAction SilentlyContinue | Where-Object { $_.Notes -eq $tag } | ForEach-Object {
+        $linux = Test-Path (Join-Path $vmroot ($_.VMName + '\seed.vhdx'))
         $ips = @((Get-VMNetworkAdapter -VMName $_.VMName -ErrorAction SilentlyContinue).IpAddresses)
+        $lip = ''
+        if ($linux) {
+          $meta = Join-Path $vmroot ($_.VMName + '\meta.json')
+          if (Test-Path $meta) {
+            try { $lip = [string]((Get-Content $meta -Raw | ConvertFrom-Json).ip) } catch { }
+          }
+        }
         emit @{
           name=$_.VMName; state=[string]$_.State; cpu_count=$_.ProcessorCount
           mem_mb=[math]::Round($_.MemoryAssigned/1MB); uptime=[string]$_.Uptime
           heartbeat=[string]$_.Heartbeat; ips=$ips
+          linux=$linux; ip=$lip
         }
       }
     }

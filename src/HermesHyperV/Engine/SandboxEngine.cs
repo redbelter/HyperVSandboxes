@@ -32,6 +32,14 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
 
     static string VmRef(string name) => name.StartsWith("mcp-") ? name[4..] : name;
 
+    /// <summary>Locate the catalog raw image for a Linux SKU.</summary>
+    string FindRaw(string raw)
+    {
+        var inMedia = Path.Combine(MediaDir, raw);
+        if (File.Exists(inMedia)) return inMedia;
+        throw new FileNotFoundException($"raw image '{raw}' is not in {MediaDir}");
+    }
+
     string FindIso(string iso)
     {
         if (Path.IsPathRooted(iso))
@@ -92,7 +100,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
 
     public async Task<JsonElement[]> ListVmsAsync(CancellationToken ct = default)
     {
-        var r = await ps.RunScriptAsync("vm_lifecycle", new { action = "list", tag = cfg.Tag }, 120, ct);
+        var r = await ps.RunScriptAsync("vm_lifecycle", new { action = "list", tag = cfg.Tag, vmroot = VmDir }, 120, ct);
         if (!r.Ok) throw new InvalidOperationException(r.Error ?? "list failed");
         // stamp the honest phase (desktop-confirmed) onto every VM row
         return (r.Data ?? []).Select(vm =>
@@ -107,8 +115,11 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     {
         var state = vm.TryGetProperty("state", out var s) ? s.GetString() : null;
         if (state != "Running") return "Off";
+        var linux = vm.TryGetProperty("linux", out var lz) && lz.GetBoolean();
         var hb = vm.TryGetProperty("heartbeat", out var h) ? h.GetString() ?? "" : "";
-        if (!hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase)) return "Installing";
+        // Linux guests have no Hyper-V IC, so heartbeat never leaves Unknown;
+        // their readiness signal alone is the ssh marker (ReadyCache).
+        if (!linux && !hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase)) return "Installing";
         // Heartbeat Ok only means the kernel/ICs respond. Honest 'Ready' =
         // desktop actually logged on (ready.txt seen by the readiness prober).
         var name = vm.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
@@ -138,12 +149,15 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
                         var name = vm.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
                         var hb = vm.TryGetProperty("heartbeat", out var h) ? h.GetString() ?? "" : "";
                         var st = vm.TryGetProperty("state", out var s2) ? s2.GetString() : null;
-                        if (st != "Running" || !hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase))
-                            continue;
+                        var linux = vm.TryGetProperty("linux", out var lz) && lz.GetBoolean();
+                        if (st != "Running") continue;
+                        if (!linux && !hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase)) continue;
                         if (ReadyCache.ContainsKey(name)) continue;
                         try
                         {
-                            var r = await engine.RunPsAsync(name, Probe, 30, ct: ct);
+                            var r = linux
+                                ? await engine.RunLinuxSshAsync(name, "cat /var/lib/sandbox-ready 2>/dev/null || echo NOT-YET", 30, ct)
+                                : await engine.RunPsAsync(name, Probe, 30, ct: ct);
                             var outp = (r.TryGetProperty("output", out var o) ? o.GetString() : "")?.Trim() ?? "";
                             if (outp.Length > 0 && !outp.Contains("NOT-YET"))
                             {
@@ -210,6 +224,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
                 ["vm"] = full, ["ready"] = true, ["ready_at"] = hot, ["cached"] = true,
             };
 
+        var isLinux = IsLinuxVm(full);
         const string probe =
             "if (Test-Path C:\\Sandbox\\ready.txt) { Get-Content C:\\Sandbox\\ready.txt } " +
             "else { 'NOT-YET' }";
@@ -220,7 +235,9 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             ct.ThrowIfCancellationRequested();
             try
             {
-                var r = await RunPsAsync(full, probe, 40, ct: ct);
+                var r = isLinux
+                    ? await RunLinuxSshAsync(full, "cat /var/lib/sandbox-ready 2>/dev/null || echo NOT-YET", 40, ct)
+                    : await RunPsAsync(full, probe, 40, ct: ct);
                 var outp = (r.TryGetProperty("output", out var o) ? o.GetString() : "")?.Trim() ?? "";
                 lastState = outp;
                 if (outp.Length > 0 && !outp.Contains("NOT-YET"))
@@ -249,12 +266,12 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     /// <summary>Golden images are keyed by (ISO file, edition, disk size): build once,
     /// reuse forever. Differencing children reference it, so it must not move.
     /// </summary>
-    string GoldenPath(string isoPath, string edition, int diskGb)
+    string GoldenPath(string isoPath, string edition, int diskGb, string ext = ".vhdx")
     {
         var key = Path.GetFileName(isoPath).ToLowerInvariant() + "|" +
                   edition.ToLowerInvariant() + "|" + diskGb;
         var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(key));
-        return Path.Combine(MediaDir, "golden", Convert.ToHexString(hash)[..16].ToLowerInvariant() + ".vhdx");
+        return Path.Combine(MediaDir, "golden", Convert.ToHexString(hash)[..16].ToLowerInvariant() + ext);
     }
 
     /// <summary>
@@ -353,6 +370,148 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         finally { /* per-VM seed dirs are cleaned by the script itself */ }
     }
 
+    /// <summary>
+    /// Next free static IP on the internal switch (192.168.50.x). Guests get
+    /// their address from the cloud-init seed, so the host always knows where
+    /// to SSH without any DHCP service. Released on delete/purge.
+    /// </summary>
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> LinuxIpPool = new();
+
+    string ClaimIp(string vmName) => LinuxIpPool.GetOrAdd(vmName,
+        _ => "192.168.50." + (10 + LinuxIpPool.Count % 200));
+
+    /// <summary>IP from pool, falling back to the VM's meta.json (service
+    /// restarts lose the pool; meta.json was written by linux_create).</summary>
+    string? LinuxIp(string vmName)
+    {
+        if (LinuxIpPool.TryGetValue(vmName, out var ip)) return ip;
+        var meta = Path.Combine(VmDir, vmName, "meta.json");
+        if (File.Exists(meta))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(meta));
+                if (doc.RootElement.TryGetProperty("ip", out var e))
+                {
+                    ip = e.GetString();
+                    if (!string.IsNullOrWhiteSpace(ip)) { LinuxIpPool[vmName] = ip; return ip; }
+                }
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    public bool IsLinuxVm(string vmName) => File.Exists(Path.Combine(VmDir, vmName, "meta.json"));
+
+    async Task<string> LinuxHostKeyAsync(CancellationToken ct)
+    {
+        Directory.CreateDirectory(Path.Combine(cfg.Root, "Linux"));
+        var r = await ps.RunScriptAsync("linux_ssh", new
+        {
+            mode = "key", root = Path.Combine(cfg.Root, "Linux"),
+        }, 120, ct);
+        var first = r.Require();
+        return first.GetProperty("pub").GetString()!;
+    }
+
+    /// <summary>
+    /// Debian/cloud image: golden is the converted raw (once), each VM is a
+    /// differencing child + per-VM NoCloud seed (hostname, pubkey, static IP).
+    /// Guest channel is SSH, not PowerShell Direct.
+    /// </summary>
+    public async Task<Dictionary<string, object?>> CreateLinuxVmAsync(
+        string name, string iso, int memoryMb = 0, int cpu = 2, int diskGb = 0,
+        CancellationToken ct = default)
+    {
+        var vmName = CheckName(name);
+        ReadyCache.TryRemove(vmName, out _);
+        if (!IsoCatalog.Entries.TryGetValue(iso, out var cat) || cat.Raw.Length == 0)
+            throw new ArgumentException($"'{iso}' is not a linux SKU in the catalog");
+        var raw = FindRaw(cat.Raw);
+        if (memoryMb == 0) memoryMb = cat.MemoryMb;
+        if (diskGb == 0) diskGb = cat.DiskGb;
+        memoryMb = Math.Clamp(memoryMb, 512, 65536);
+        cpu = Math.Clamp(cpu, 1, 128);
+        diskGb = Math.Clamp(diskGb, 4, 2040);
+
+        // fixed VHD keeps the raw size; a differencing child may be larger,
+        // so the golden is shared across all disk sizes for this image.
+        var golden = GoldenPath(cat.Raw, "linux", 0);
+        if (!File.Exists(golden))
+        {
+            await GoldenGate.WaitAsync(ct);
+            try
+            {
+                if (!File.Exists(golden))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(golden)!);
+                    log.LogInformation("converting linux golden {Golden} from {Raw} (once, ~2 min)",
+                        golden, Path.GetFileName(raw));
+                    var gold = await ps.RunScriptAsync("linux_golden", new
+                    {
+                        vhd = golden, raw,
+                    }, 2400, ct);
+                    if (!gold.Ok) throw new InvalidOperationException($"linux golden failed: {gold.Error}");
+                }
+            }
+            finally { GoldenGate.Release(); }
+        }
+
+        var ip = ClaimIp(vmName);
+        var pubkey = await LinuxHostKeyAsync(ct);
+        var hostname = new string(VmRef(vmName).Where(c => char.IsAsciiLetterOrDigit(c) || c == '-').ToArray());
+        if (hostname.Length == 0) hostname = "sandbox";
+        if (hostname.Length > 15) hostname = hostname[..15];
+
+        log.LogInformation("spawning linux {Vm} from golden ({Golden}) ip={Ip}", vmName,
+            Path.GetFileName(golden), ip);
+        var create = await ps.RunScriptAsync("vm_lifecycle", new
+        {
+            action = "linux_create", name = vmName, root = Path.Combine(VmDir, vmName),
+            golden, mem_mb = memoryMb, cpu, disk_gb = diskGb,
+            @switch = cfg.Switch, tag = cfg.Tag,
+            ip, hostname, pubkey,
+        }, 600, ct);
+        var created = create.Require();
+
+        return new Dictionary<string, object?>
+        {
+            ["vm"] = vmName,
+            ["state"] = created.TryGetProperty("state", out var s2) ? s2.GetString() : null,
+            ["ip"] = ip,
+            ["guest_user"] = cat.User,
+            ["folder"] = Path.Combine(VmDir, vmName),
+            ["note"] = $"Debian boots with cloud-init; first boot ~1 min. Then run_ps '{name}' runs " +
+                       "shell over SSH as " + cat.User + ". wait_ready confirms /var/lib/sandbox-ready.",
+        };
+    }
+
+    /// <summary>SSH into a linux sandbox VM (BatchMode, service key).</summary>
+    public async Task<JsonElement> RunLinuxSshAsync(string name, string command, int timeoutSec = 60,
+                                                    CancellationToken ct = default)
+    {
+        var full = CheckName(name);
+        var ip = LinuxIp(full) ?? throw new InvalidOperationException(
+            $"no ip recorded for {full} — restart the service loses the pool; VM is still reachable " +
+            "from its Hyper-V console");
+        var r = await ps.RunScriptAsync("linux_ssh", new
+        {
+            mode = "exec", root = Path.Combine(cfg.Root, "Linux"),
+            host = ip, cmd = command, timeout_s = timeoutSec,
+        }, timeoutSec + 60, ct);
+        var first = r.First ?? throw new InvalidOperationException(
+            !string.IsNullOrEmpty(r.Error) ? $"ssh exec failed: {r.Error}" : "ssh exec emitted nothing");
+        // data[0].step='exec' with the result nested? we emit @{step='exec'} then the table:
+        // simpler contract: find a member carrying 'output'
+        var node = first;
+        if (!first.TryGetProperty("output", out _) &&
+            first.TryGetProperty("result", out var nested)) node = nested;
+        var outp = node.TryGetProperty("output", out var o) ? o.GetString() : null;
+        var timedOut = node.TryGetProperty("timed_out", out var t) && t.ValueKind == JsonValueKind.True;
+        return JsonSerializer.SerializeToElement(new { vm = full, ip, output = outp, timed_out = timedOut });
+    }
+
     public Task<JsonElement> PowerVmAsync(string name, string want, CancellationToken ct = default)
     {
         var full = CheckName(name);
@@ -390,6 +549,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
                                               string? user = null, string? password = null, CancellationToken ct = default)
     {
         var full = CheckName(name);
+        if (IsLinuxVm(full)) return await RunLinuxSshAsync(full, command, timeoutSec, ct);
         var cmdB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(command));
         var r = await ps.RunScriptAsync("guest_exec", new
         {
