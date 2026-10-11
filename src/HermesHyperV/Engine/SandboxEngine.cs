@@ -434,6 +434,23 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
 
     public bool IsLinuxVm(string vmName) => File.Exists(Path.Combine(VmDir, vmName, "meta.json"));
 
+    /// <summary>Resolve what /ws/term needs: guest IP + service ssh key path
+    /// (created on demand). Throws with a human message the terminal prints.</summary>
+    public async Task<(string ip, string key)> LinuxTermTargetAsync(string name, CancellationToken ct)
+    {
+        var full = CheckName(name);
+        if (!IsLinuxVm(full))
+            throw new InvalidOperationException(
+                $"{full} is not a Linux sandbox — Windows guests have no SSH listener; use run_ps");
+        var ip = LinuxIp(full) ?? throw new InvalidOperationException(
+            $"{full} has no recorded IP — start it, or the service lost the pool (recreate)");
+        var pubkey = await LinuxHostKeyAsync(ct);   // ensures the keypair exists
+        var key = Path.Combine(cfg.Root, "Linux", "linux_id_ed25519");
+        if (!File.Exists(key)) throw new InvalidOperationException("service ssh key missing: " + key);
+        _ = pubkey;
+        return (ip, key);
+    }
+
     async Task<string> LinuxHostKeyAsync(CancellationToken ct)
     {
         Directory.CreateDirectory(Path.Combine(cfg.Root, "Linux"));

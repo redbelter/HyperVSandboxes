@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <title>hyperv-sandbox — dashboard</title>
+<link rel="stylesheet" href="/xterm.css">
+<script src="/xterm.js"></script>
 <style>
   :root { --bg:#0e1116; --panel:#161b22; --border:#2d333b; --fg:#e6edf3; --dim:#8b949e;
           --accent:#4493f8; --ok:#30a46c; --warn:#f76b15; --err:#e5484d; }
@@ -50,6 +52,9 @@
   .creds b { color:var(--fg); cursor:pointer; }
   .creds b:hover { color:var(--accent); }
   .con .err { color:var(--err); } .con .dim { color:var(--dim); } .con .pmt { color:var(--ok); }
+  .term { height:340px; border-radius:8px; overflow:hidden; background:#0d1117; }
+  .term .xterm { height:100%; }
+  .xterm-viewport::-webkit-scrollbar{ width:8px } .xterm-viewport::-webkit-scrollbar-thumb{ background:#2d333b; border-radius:4px }
 </style>
 </head>
 <body>
@@ -100,6 +105,17 @@
       <div class="log" id="log"></div>
     </div>
   </div>
+</div>
+<div class="panel">
+  <h2>Terminal — real SSH into a Linux sandbox</h2>
+  <div class="row">
+    <select id="tsel"></select>
+    <button class="pri" id="tbtn" onclick="termOpen()">connect</button>
+    <button onclick="termKill()">disconnect</button>
+    <button onclick="if(term)term.reset()">clear</button>
+    <span class="flabel" id="tstate">not connected</span>
+  </div>
+  <div class="term" id="term"></div>
 </div>
 </div>
 <script>
@@ -153,6 +169,7 @@ function renderVMs(data){
     return '<div class="vm"><div class="hd"><b>'+esc(v.name)+(lin?' <span class="chip">debian</span>':'')+'</b><span class="chip '+v.phase+'">'+esc(chipTxt)+'</span></div>'+
       '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(ip?esc(ip):(v.state==='Running'?'no IP yet (installing / network idle)':'—'))+'</div>'+creds+
       '<div class="acts"><button '+(ready?'':'disabled ')+'onclick="pick(\''+esc(v.name)+'\')">run_ps</button>'+
+      (lin?'<button '+(ready?'':'disabled ')+'onclick="termGo(\''+esc(v.name)+'\')">terminal</button>':'')+
       '<button '+(v.state==='Running'?'':'disabled ')+'onclick="act(\'/api/start\',\''+esc(v.name)+'\')" '+(v.state==='Running'?'style=display:none':'')+'>start</button>'+
       '<button '+(v.state==='Running'?'':'disabled ')+'onclick="act(\'/api/stop\',\''+esc(v.name)+'\')" '+(v.state!=='Running'?'style=display:none':'')+'>stop</button>'+
       '<button class="danger" onclick="act(\'/api/delete\',\''+esc(v.name)+'\')">delete</button></div></div>';
@@ -162,6 +179,13 @@ function renderVMs(data){
   var cur=sel.value;
   sel.innerHTML=ready.length?ready.map(n=>'<option>'+esc(n)+'</option>').join(''):'<option value="">— no Ready VM —</option>';
   if(ready.indexOf(cur)>=0) sel.value=cur;
+  var ts=document.getElementById('tsel');
+  if(ts){
+    var lready=vmCache.filter(v=>v.linux===true && v.phase==='Ready').map(v=>v.name);
+    var tcur=ts.value;
+    ts.innerHTML=lready.length?lready.map(n=>'<option>'+esc(n)+'</option>').join(''):'<option value="">— no Ready Linux VM —</option>';
+    if(lready.indexOf(tcur)>=0) ts.value=tcur;
+  }
 }
 function pollVMs(){ jget('/api/vms').then(d=>{ if(d.ok) renderVMs(d.data); }).catch(function(){}); }
 function pollJobs(){
@@ -231,6 +255,37 @@ function runCmd(){
   jpost('/api/run',{name:n,cmd:c});
   con.scrollTop=con.scrollHeight;
 }
+var term=null, tws=null;
+function termEnsure(){
+  if(term) return term;
+  term=new Terminal({theme:{background:'#0d1117',foreground:'#e6edf3',cursor:'#4493f8'},
+                     fontSize:13,fontFamily:'ui-monospace,Consolas,monospace',
+                     scrollback:5000,cursorBlink:true,convertEol:true});
+  term.open(document.getElementById('term'));
+  term.onData(function(d){ if(tws&&tws.readyState===1) tws.send(d); });
+  return term;
+}
+function termOpen(){
+  var n=document.getElementById('tsel').value;
+  if(!n){ termNote('pick a Linux VM first'); return; }
+  termKill();
+  termEnsure(); term.reset(); termNote('connecting to '+n+'…');
+  var proto=location.protocol==='https:'?'wss':'ws';
+  tws=new WebSocket(proto+'://'+location.host+'/ws/term?name='+encodeURIComponent(n)+'&rows='+term.rows+'&cols='+term.cols);
+  tws.binaryType='arraybuffer';
+  tws.onopen=function(){ termNote('connected — real bash session on '+n); document.getElementById('tbtn').textContent='reconnect'; term.focus(); };
+  tws.onmessage=function(ev){
+    if(ev.data instanceof ArrayBuffer) term.write(new Uint8Array(ev.data));
+    else term.write(ev.data);
+  };
+  tws.onclose=function(){ termNote('disconnected'); document.getElementById('tbtn').textContent='connect'; };
+  tws.onerror=function(){ termNote('websocket error'); };
+}
+function termGo(n){ var ts=document.getElementById('tsel'); if(ts){ ts.value=n; } document.querySelector('.term').scrollIntoView({behavior:'smooth'}); termOpen(); }
+function termKill(){
+  if(tws){ try{tws.onclose=null; tws.close();}catch(e){} tws=null; }
+}
+function termNote(s){ document.getElementById('tstate').textContent=s; }
 setInterval(pollLog,1500); setInterval(pollStatus,10000); setInterval(pollVMs,6000); setInterval(pollJobs,1800);
 pollStatus(); pollVMs(); pollLog(); loadCatalog();
 </script>

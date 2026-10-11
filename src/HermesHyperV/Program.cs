@@ -36,6 +36,7 @@ app.UseStaticFiles(); // wwwroot/dashboard.html
 app.MapGet("/", () => Results.Redirect("/dashboard.html"));
 app.MapGet("/index.html", () => Results.Redirect("/dashboard.html"));
 app.MapSandboxApi();
+app.MapTerminal();   // /ws/term (browser ssh into Linux sandboxes)
 app.MapMcp("/mcp");
 
 app.Logger.LogInformation("HermesHyperV service starting on :{Port} (mcp=/mcp, ui=/dashboard.html)", port);
