@@ -52,6 +52,10 @@
   .creds b { color:var(--fg); cursor:pointer; }
   .creds b:hover { color:var(--accent); }
   .con .err { color:var(--err); } .con .dim { color:var(--dim); } .con .pmt { color:var(--ok); }
+  .vm { cursor:pointer; }
+  .vm.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .tab { padding:4px 12px; border-radius:8px; border:1px solid var(--border); background:none; color:var(--dim); cursor:pointer; font:inherit; font-size:12px; }
+  .tab.on { color:var(--accent); border-color:var(--accent); background:rgba(68,147,248,.08); font-weight:600; }
   .term { height:340px; border-radius:8px; overflow:hidden; background:#0d1117; }
   .term .xterm { height:100%; }
   .xterm-viewport::-webkit-scrollbar{ width:8px } .xterm-viewport::-webkit-scrollbar-thumb{ background:#2d333b; border-radius:4px }
@@ -84,14 +88,26 @@
       </div>
       <div class="vms" id="vms"><div class="empty">loading…</div></div>
     </div>
-    <div class="panel">
-      <h2>run_ps — PowerShell Direct into guest</h2>
-      <div class="con" id="con">pick a Ready VM, type a command →</div>
-      <div class="row">
-        <select id="vsel"></select>
-        <input id="cmd" style="flex:1" placeholder="Get-ComputerInfo | Select OsName, OsVersion"
-               onkeydown="if(event.key==='Enter')runCmd()">
-        <button onclick="runCmd()">run</button>
+    <div class="panel" id="conPanel">
+      <h2 id="conTitle">Guest console — click a VM below</h2>
+      <div class="row" id="modeTabs"></div>
+      <div id="paneRun">
+        <div class="con" id="con">pick a Ready VM, type a command →</div>
+        <div class="row">
+          <span class="flabel" id="runVia">no VM selected</span>
+          <input id="cmd" style="flex:1" placeholder="select a Ready VM above"
+                 onkeydown="if(event.key==='Enter')runCmd()">
+          <button onclick="runCmd()">run</button>
+        </div>
+      </div>
+      <div id="paneTerm" style="display:none">
+        <div class="row">
+          <button class="pri" id="tbtn" onclick="termOpen()">connect</button>
+          <button onclick="termKill()">disconnect</button>
+          <button onclick="if(term)term.reset()">clear</button>
+          <span class="flabel" id="tstate">not connected</span>
+        </div>
+        <div class="term" id="term"></div>
       </div>
     </div>
   </div>
@@ -106,20 +122,9 @@
     </div>
   </div>
 </div>
-<div class="panel">
-  <h2>Terminal — real SSH into a Linux sandbox</h2>
-  <div class="row">
-    <select id="tsel"></select>
-    <button class="pri" id="tbtn" onclick="termOpen()">connect</button>
-    <button onclick="termKill()">disconnect</button>
-    <button onclick="if(term)term.reset()">clear</button>
-    <span class="flabel" id="tstate">not connected</span>
-  </div>
-  <div class="term" id="term"></div>
-</div>
 </div>
 <script>
-var logN = 0, jobs = {}, vmCache = [];
+var logN = 0, jobs = {}, vmCache = [], selName = null, selMode = null;
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
 function jget(u){ return fetch(u).then(r=>r.json()); }
 function jpost(u,b){ return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json()); }
@@ -166,26 +171,16 @@ function renderVMs(data){
     var ci = vmCache.indexOf(v);
     var creds = v.guest_user ? ('<div class="creds">login <b title="click to copy user:password" onclick="cpw('+ci+')">'+esc(v.guest_user)+(v.guest_password?' / '+esc(v.guest_password):'')+'</b>'+
                   (lin&&ip?' · ssh '+esc(v.guest_user)+'@'+esc(ip):'')+'</div>') : '';
-    return '<div class="vm"><div class="hd"><b>'+esc(v.name)+(lin?' <span class="chip">debian</span>':'')+'</b><span class="chip '+v.phase+'">'+esc(chipTxt)+'</span></div>'+
+    return '<div class="vm'+(v.name===selName?' sel':'')+'" onclick="selectVM(\''+esc(v.name)+'\')"><div class="hd"><b>'+esc(v.name)+(lin?' <span class="chip">debian</span>':'')+'</b><span class="chip '+v.phase+'">'+esc(chipTxt)+'</span></div>'+
       '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(ip?esc(ip):(v.state==='Running'?'no IP yet (installing / network idle)':'—'))+'</div>'+creds+
-      '<div class="acts"><button '+(ready?'':'disabled ')+'onclick="pick(\''+esc(v.name)+'\')">run_ps</button>'+
-      (lin?'<button '+(ready?'':'disabled ')+'onclick="termGo(\''+esc(v.name)+'\')">terminal</button>':'')+
-      '<button '+(v.state==='Running'?'':'disabled ')+'onclick="act(\'/api/start\',\''+esc(v.name)+'\')" '+(v.state==='Running'?'style=display:none':'')+'>start</button>'+
-      '<button '+(v.state==='Running'?'':'disabled ')+'onclick="act(\'/api/stop\',\''+esc(v.name)+'\')" '+(v.state!=='Running'?'style=display:none':'')+'>stop</button>'+
-      '<button class="danger" onclick="act(\'/api/delete\',\''+esc(v.name)+'\')">delete</button></div></div>';
+      '<div class="acts"><button '+(ready?'':'disabled ')+'onclick="event.stopPropagation();pick(\''+esc(v.name)+'\','+(lin?'true':'false')+')">'+(lin?'command':'powershell')+'</button>'+
+      (lin?'<button '+(ready?'':'disabled ')+'onclick="event.stopPropagation();termGo(\''+esc(v.name)+'\')">terminal</button>':'')+
+      '<button '+(v.state==='Running'?'':'disabled ')+'onclick="event.stopPropagation();act(\'/api/start\',\''+esc(v.name)+'\')" '+(v.state==='Running'?'style=display:none':'')+'>start</button>'+
+      '<button '+(v.state==='Running'?'':'disabled ')+'onclick="event.stopPropagation();act(\'/api/stop\',\''+esc(v.name)+'\')" '+(v.state!=='Running'?'style=display:none':'')+'>stop</button>'+
+      '<button class="danger" onclick="event.stopPropagation();act(\'/api/delete\',\''+esc(v.name)+'\')">delete</button></div></div>';
   }).join('');
-  var sel=document.getElementById('vsel');
-  var ready=vmCache.filter(v=>v.phase==='Ready').map(v=>v.name);
-  var cur=sel.value;
-  sel.innerHTML=ready.length?ready.map(n=>'<option>'+esc(n)+'</option>').join(''):'<option value="">— no Ready VM —</option>';
-  if(ready.indexOf(cur)>=0) sel.value=cur;
-  var ts=document.getElementById('tsel');
-  if(ts){
-    var lready=vmCache.filter(v=>v.linux===true && v.phase==='Ready').map(v=>v.name);
-    var tcur=ts.value;
-    ts.innerHTML=lready.length?lready.map(n=>'<option>'+esc(n)+'</option>').join(''):'<option value="">— no Ready Linux VM —</option>';
-    if(lready.indexOf(tcur)>=0) ts.value=tcur;
-  }
+  if(selName && !vmCache.some(v=>v.name===selName)) { selName=null; selMode=null; }
+  syncConsole();
 }
 function pollVMs(){ jget('/api/vms').then(d=>{ if(d.ok) renderVMs(d.data); }).catch(function(){}); }
 function pollJobs(){
@@ -237,7 +232,59 @@ function createVM(){
 }
 function act(u,name){ jpost(u,{name:name}); setTimeout(pollVMs,1200); setTimeout(pollVMs,5000); }
 function purge(){ if(confirm('Destroy ALL tagged sandbox VMs and their files?')){ jpost('/api/purge',{}); setTimeout(pollVMs,2000);} }
-function pick(n){ document.getElementById('vsel').value=n; document.getElementById('cmd').focus(); }
+function selectVM(n){
+  var v=vmCache.find(x=>x.name===n); if(!v) return;
+  if(selName!==n){ selMode=null; if(tws) termKill(); }   // new VM = fresh mode + drop ssh
+  selName=n;
+  // pick the mode that makes sense for THIS vm
+  if(!selMode) selMode = v.linux ? (v.phase==='Ready'?'term':'cmd') : (v.phase==='Ready'?'ps':'cmd');
+  syncConsole();
+}
+function setMode(m){ selMode=m; syncConsole(); }
+function pick(n,lin){
+  selectVM(n);
+  var v=vmCache.find(x=>x.name===n)||{};
+  if(v.phase==='Ready') selMode = lin?'cmd':'ps';
+  syncConsole();
+}
+function syncConsole(){
+  var v=vmCache.find(x=>x.name===selName);
+  var title=document.getElementById('conTitle'), tabs=document.getElementById('modeTabs'),
+      paneRun=document.getElementById('paneRun'), paneTerm=document.getElementById('paneTerm');
+  if(!v){
+    title.textContent='Guest console — click a VM below';
+    tabs.innerHTML=''; paneRun.style.display=''; paneTerm.style.display='none';
+    document.getElementById('runVia').textContent='no VM selected';
+    document.getElementById('cmd').placeholder='select a VM above';
+    return;
+  }
+  if(!v.linux && selMode==='term') selMode='ps';          // windows can't ssh
+  var ready=v.phase==='Ready';
+  // tabs worth showing for this OS
+  var t='';
+  if(v.linux){
+    t='<button class="tab'+(selMode==='term'?' on':'')+'" onclick="setMode(\'term\')">SSH terminal</button>'+
+      '<button class="tab'+(selMode==='cmd'?' on':'')+'" onclick="setMode(\'cmd\')">one-shot command</button>';
+  } else {
+    t='<button class="tab'+(selMode==='ps'?' on':'')+'" onclick="setMode(\'ps\')">PowerShell Direct</button>';
+  }
+  if(!ready) t+='<span class="flabel">console unlocks when the guest is Ready ('+esc(v.phase)+')</span>';
+  tabs.innerHTML=t;
+  var termMode = v.linux && selMode==='term';
+  paneTerm.style.display = termMode ? '' : 'none';
+  paneRun.style.display  = termMode ? 'none' : '';
+  if(termMode){
+    title.textContent='SSH terminal — '+v.name+' ('+(v.ip||'?')+')';
+    termEnsure();
+    if(!tws) termOpen(v.name);              // auto-connect on switch
+  } else {
+    title.textContent = v.linux ? 'One-shot command — '+v.name : 'PowerShell Direct — '+v.name;
+    document.getElementById('runVia').textContent='→ '+v.name+(ready?'':' (not Ready)');
+    var cmd=document.getElementById('cmd');
+    cmd.placeholder = v.linux ? 'df -h; uptime — bash over ssh' : 'Get-ComputerInfo | Select OsName, OsVersion';
+    if(selName) cmd.focus();
+  }
+}
 function cpw(i){
   var v=vmCache[i]; if(!v) return;
   navigator.clipboard.writeText(v.guest_user+':'+(v.guest_password||''));
@@ -245,8 +292,9 @@ function cpw(i){
   c.innerHTML += '<div class="dim">copied ' + esc(v.guest_user) + ' credentials to clipboard</div>';
 }
 function runCmd(){
-  var n=document.getElementById('vsel').value, c=document.getElementById('cmd').value.trim();
+  var n=selName, c=document.getElementById('cmd').value.trim();
   if(!n||!c) return;
+  var vv=vmCache.find(x=>x.name===n); if(vv&&vv.phase!=='Ready'){ termNote(vv.name+' is not Ready yet'); return; }
   var v=vmCache.find(x=>x.name===n)||{};
   var prompt = v.linux ? 'sandbox@'+esc(n.replace(/^mcp-/,''))+':~$ ' : 'PS C:\\Users\\Sandbox&gt; ';
   var con=document.getElementById('con');
@@ -265,8 +313,8 @@ function termEnsure(){
   term.onData(function(d){ if(tws&&tws.readyState===1) tws.send(d); });
   return term;
 }
-function termOpen(){
-  var n=document.getElementById('tsel').value;
+function termOpen(n){
+  n=n||selName;
   if(!n){ termNote('pick a Linux VM first'); return; }
   termKill();
   termEnsure(); term.reset(); termNote('connecting to '+n+'…');
@@ -281,9 +329,13 @@ function termOpen(){
   tws.onclose=function(){ termNote('disconnected'); document.getElementById('tbtn').textContent='connect'; };
   tws.onerror=function(){ termNote('websocket error'); };
 }
-function termGo(n){ var ts=document.getElementById('tsel'); if(ts){ ts.value=n; } document.querySelector('.term').scrollIntoView({behavior:'smooth'}); termOpen(); }
+function termGo(n){
+  var v=vmCache.find(x=>x.name===n); if(!v) return;
+  selName=n; selMode='term'; syncConsole();
+  document.getElementById('conPanel').scrollIntoView({behavior:'smooth'});
+}
 function termKill(){
-  if(tws){ try{tws.onclose=null; tws.close();}catch(e){} tws=null; }
+  if(tws){ try{tws.onclose=null; tws.close();}catch(e){} tws=null; termNote('disconnected'); }
 }
 function termNote(s){ document.getElementById('tstate').textContent=s; }
 setInterval(pollLog,1500); setInterval(pollStatus,10000); setInterval(pollVMs,6000); setInterval(pollJobs,1800);
