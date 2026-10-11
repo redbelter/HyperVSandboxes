@@ -125,17 +125,30 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     }
 
     /// <summary>
-    /// S/W/R drive letters are a machine-global namespace, and provisioning
-    /// binds them to ITS OWN partitions. Two concurrent create_vm jobs would
-    /// collide on them (or yank W: out from under each other's dism apply),
-    /// so provisioning is a global critical section: concurrent calls queue.
+    /// Only the golden build needs serialization (concurrent builds of the
+    /// same key would fight over its seed dirs). Child-disk creation uses
+    /// per-VM mount-point folders and runs fully concurrently.
     /// </summary>
-    static readonly SemaphoreSlim ProvisionGate = new(1, 1);
+    static readonly SemaphoreSlim GoldenGate = new(1, 1);
 
     /// <summary>
-    /// Provision + create + start a disposable Gen-2 VM. Blocking: image
-    /// apply takes ~8-12 min (runs in one hidden dism.exe). Returns once the
-    /// VM is Running; guest answers run_ps ~2-4 min later (heartbeat Ok).
+    /// Golden images are keyed by (ISO file, edition, disk size): build once,
+    /// reuse forever. Differencing children reference it, so it must not move.
+    /// </summary>
+    string GoldenPath(string isoPath, string edition, int diskGb)
+    {
+        var key = Path.GetFileName(isoPath).ToLowerInvariant() + "|" +
+                  edition.ToLowerInvariant() + "|" + diskGb;
+        var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(key));
+        return Path.Combine(MediaDir, "golden", Convert.ToHexString(hash)[..16].ToLowerInvariant() + ".vhdx");
+    }
+
+    /// <summary>
+    /// Create + start a disposable Gen-2 VM from the golden image: an
+    /// instant differencing child VHDX + per-VM Panther unattend (first call
+    /// for an ISO/edition also builds the golden once, ~2-4 min). Returns
+    /// with the VM booting into auto-OOBE; desktop answers run_ps ~1-2 min
+    /// later.
     /// </summary>
     public async Task<Dictionary<string, object?>> CreateVmAsync(
         string name, string iso = "server2025-eval", string? edition = null,
@@ -161,15 +174,38 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         var oobe = RenderOobe(vmName, password);
         var vroot = Path.Combine(VmDir, vmName);
 
-        await ProvisionGate.WaitAsync(ct);
+        var golden = GoldenPath(path, edition, diskGb);
+        if (!File.Exists(golden))
+        {
+            // One build per (ISO, edition, disk size), serialized; every
+            // later create skips this entirely.
+            await GoldenGate.WaitAsync(ct);
+            try
+            {
+                if (!File.Exists(golden))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(golden)!);
+                    log.LogInformation("building golden image {Golden} from {Iso} (once per ISO+edition, ~2-4 min)",
+                        golden, Path.GetFileName(path));
+                    var gold = await ps.RunScriptAsync("golden_image", new
+                    {
+                        golden, iso = path, edition, disk_gb = diskGb,
+                    }, 2400, ct);
+                    if (!gold.Ok) throw new InvalidOperationException($"golden image build failed: {gold.Error}");
+                }
+            }
+            finally { GoldenGate.Release(); }
+        }
+
         try
         {
-            log.LogInformation("provisioning {Vm} from {Iso} (~10 min, hidden dism)", vmName, Path.GetFileName(path));
-            var prov = await ps.RunScriptAsync("provision_disk", new
+            // child vhdx + per-VM Panther unattend (~5-10 s, concurrent-safe)
+            log.LogInformation("spawning {Vm} from golden ({Golden})", vmName, Path.GetFileName(golden));
+            var child = await ps.RunScriptAsync("child_disk", new
             {
-                root = vroot, vmroot = VmDir, iso = path, edition, unattend = oobe, disk_gb = diskGb,
-            }, 1800, ct);
-            if (!prov.Ok) throw new InvalidOperationException($"provisioning failed: {prov.Error}");
+                golden, root = vroot, unattend = oobe,
+            }, 300, ct);
+            if (!child.Ok) throw new InvalidOperationException($"child disk creation failed: {child.Error}");
 
             var create = await ps.RunScriptAsync("vm_lifecycle", new
             {
@@ -194,7 +230,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
                            "heartbeat is Ok / run_ps answers, the guest is live (~2-4 min).",
             };
         }
-        finally { ProvisionGate.Release(); }
+        finally { /* per-VM seed dirs are cleaned by the script itself */ }
     }
 
     public Task<JsonElement> PowerVmAsync(string name, string want, CancellationToken ct = default)
