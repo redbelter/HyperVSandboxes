@@ -45,7 +45,7 @@ internal static class GuestDefaults
     }
 }
 
-internal sealed record IsoEntry(string File, string Edition, int MemoryMb, int DiskGb);
+internal sealed record IsoEntry(string File, string Edition, int MemoryMb, int DiskGb, string Label);
 
 internal static class IsoCatalog
 {
@@ -55,7 +55,14 @@ internal static class IsoCatalog
     {
         ["server2025-eval"] = new(
             "26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso",
-            "Windows Server 2025 Datacenter Evaluation (Desktop Experience)", 4096, 64),
+            "Windows Server 2025 Datacenter Evaluation (Desktop Experience)", 4096, 64,
+            "Server 2025"),
+        // Eval Center fwlink 2382600; Enterprise eval skips the MS-account
+        // requirement, boots fine without TPM via offline apply.
+        ["win11ent-26h2"] = new(
+            "26300.9457.260913-1737.26h2_ge_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso",
+            "Windows 11 Enterprise Evaluation", 8192, 64,
+            "Windows 11 Enterprise"),
     };
 }
 
@@ -74,6 +81,7 @@ internal static class Oobe
     </settings>
     <settings pass="oobeSystem">
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <Eula><Accept>true</Accept></Eula>
             <AutoLogon>
                 <Password><PlainText>true</PlainText><Value>__PASSWORD__</Value></Password>
                 <LogonCount>5</LogonCount>

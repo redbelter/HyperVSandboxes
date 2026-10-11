@@ -43,10 +43,11 @@ public static class Api
             var name = string.IsNullOrWhiteSpace(body.Name)
                 ? $"sandbox-{DateTimeOffset.UtcNow.ToUnixTimeSeconds() % 100000}"
                 : body.Name!.Trim();
-            jobs.Blog($"create_vm(name=\"{name}\", iso=\"server2025-eval\")", "tool");
+            var iso = string.IsNullOrWhiteSpace(body.Iso) ? "server2025-eval" : body.Iso!.Trim();
+            jobs.Blog($"create_vm(name=\"{name}\", iso=\"{iso}\")", "tool");
             var jid = jobs.Spawn("create_vm", async ct => await e.CreateVmAsync(
-                name, memoryMb: body.MemoryMb ?? 4096, cpu: body.Cpu ?? 2,
-                diskGb: body.DiskGb ?? 64, ct: ct));
+                name, iso, memoryMb: body.MemoryMb ?? 0, cpu: body.Cpu ?? 2,
+                diskGb: body.DiskGb ?? 0, ct: ct));
             return Results.Json(new { job = jid });
         });
 
@@ -85,6 +86,25 @@ public static class Api
 
         api.MapGet("/jobs", (JobStore jobs) => Results.Json(new { jobs = jobs.Jobs() }));
 
+        api.MapGet("/catalog", () => Results.Json(new
+        {
+            ok = true,
+            data = new
+            {
+                isos = IsoCatalog.Entries.Select(kv => new
+                {
+                    key = kv.Key,
+                    label = kv.Value.Label,
+                    edition = kv.Value.Edition,
+                    memory_mb = kv.Value.MemoryMb,
+                    disk_gb = kv.Value.DiskGb,
+                    present = File.Exists(Path.Combine(
+                        Environment.GetEnvironmentVariable("HYPERV_ROOT") ?? @"C:\HyperV",
+                        "Media", kv.Value.File)),
+                }).ToList(),
+            },
+        }));
+
         api.MapGet("/log", (JobStore jobs, int? since) =>
         {
             var (items, n) = jobs.LogSince(since ?? 0);
@@ -106,6 +126,7 @@ public static class Api
                                 [property: System.Text.Json.Serialization.JsonPropertyName("cmd")] string? Cmd,
                                 [property: System.Text.Json.Serialization.JsonPropertyName("timeout_s")] int? TimeoutS);
     public sealed record CreateReq([property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
+                                   [property: System.Text.Json.Serialization.JsonPropertyName("iso")] string? Iso,
                                    [property: System.Text.Json.Serialization.JsonPropertyName("memory_mb")] int? MemoryMb,
                                    [property: System.Text.Json.Serialization.JsonPropertyName("cpu")] int? Cpu,
                                    [property: System.Text.Json.Serialization.JsonPropertyName("disk_gb")] int? DiskGb);

@@ -152,19 +152,24 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     /// </summary>
     public async Task<Dictionary<string, object?>> CreateVmAsync(
         string name, string iso = "server2025-eval", string? edition = null,
-        int memoryMb = 4096, int maxMemoryMb = 8196, int cpu = 2, int diskGb = 64,
+        int memoryMb = 0, int maxMemoryMb = 0, int cpu = 2, int diskGb = 0,
         string? password = null, CancellationToken ct = default)
     {
         var vmName = CheckName(name);
         var path = FindIso(iso);
+        IsoEntry? cat = null;
         if (edition is null)
         {
             if (IsoCatalog.Entries.TryGetValue(iso, out var entry) &&
                 string.Equals(Path.GetFileName(path), entry.File, StringComparison.OrdinalIgnoreCase))
-                edition = entry.Edition;
+            { edition = entry.Edition; cat = entry; }
             else
                 throw new ArgumentException("edition unknown for this ISO; call list_editions first");
         }
+        // per-SKU sizing defaults (Win11 wants 8 GB, Server 4 GB) unless overridden
+        if (memoryMb == 0) memoryMb = cat?.MemoryMb ?? 4096;
+        if (maxMemoryMb == 0) maxMemoryMb = Math.Min(memoryMb * 2, 16384);
+        if (diskGb == 0) diskGb = cat?.DiskGb ?? 64;
         memoryMb = Math.Clamp(memoryMb, 1024, 65536);
         maxMemoryMb = Math.Clamp(maxMemoryMb, memoryMb, 65536);
         cpu = Math.Clamp(cpu, 1, 128);

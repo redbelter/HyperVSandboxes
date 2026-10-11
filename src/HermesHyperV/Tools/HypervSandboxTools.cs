@@ -50,9 +50,11 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
         "it with delete_vm.")]
     public async Task<JsonElement> Create_vm(
         string name, CancellationToken ct,
-        [Description("catalog name 'server2025-eval', file name in C:\\HyperV\\Media, or absolute path")] string iso = "server2025-eval",
+        [Description("catalog name 'server2025-eval' | 'win11ent-26h2', file name in C:\\HyperV\\Media, or absolute path")] string iso = "server2025-eval",
         string? edition = null,
-        int memory_mb = 4096, int max_memory_mb = 8196, int cpu = 2, int disk_gb = 64,
+        [Description("0 = per-SKU default (Server 4096, Win11 8192)")] int memory_mb = 0,
+        int max_memory_mb = 0, int cpu = 2,
+        [Description("0 = catalog default (64)")] int disk_gb = 0,
         string? password = null)
         => JsonSerializer.SerializeToElement(await engine.CreateVmAsync(
             name, iso, edition, memory_mb, max_memory_mb, cpu, disk_gb, password, ct));

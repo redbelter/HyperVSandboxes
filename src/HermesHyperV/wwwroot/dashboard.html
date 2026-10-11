@@ -66,6 +66,7 @@
       <h2>Sandbox VMs · C:\HyperV\VMs</h2>
       <div class="row">
         <button class="pri" onclick="createVM()">＋ create_vm</button>
+        <span class="flabel">OS</span><select id="os" onchange="osPick()"></select>
         <span class="flabel">name</span><input id="nm" placeholder="auto" style="width:110px">
         <span class="flabel">MB</span><input id="mem" value="4096" style="width:64px">
         <span class="flabel">vCPU</span><input id="cpu" value="2" style="width:48px">
@@ -166,11 +167,29 @@ function pollJobs(){
     });
   }).catch(function(){});
 }
+var osCatalog=[];
+function loadCatalog(){
+  jget('/api/catalog').then(d=>{
+    osCatalog=(d.data&&d.data.isos)||[];
+    var s=document.getElementById('os'); if(!s) return;
+    s.innerHTML=osCatalog.map(x=>'<option value="'+x.key+'"'+(x.present?'':' title="ISO not in C:\\HyperV\\Media"')+'>'+esc(x.label)+(x.present?'':' ⬇')+'</option>').join('');
+    osPick();
+  }).catch(function(){});
+}
+function osPick(){
+  var k=document.getElementById('os').value, x=osCatalog.find(i=>i.key===k);
+  if(!x) return;
+  if(x.memory_mb) document.getElementById('mem').value=x.memory_mb;
+  if(x.disk_gb) document.getElementById('disk').value=x.disk_gb;
+}
 function createVM(){
+  var k=document.getElementById('os').value||undefined;
+  var x=osCatalog.find(i=>i.key===k)||{};
   var b={ name:document.getElementById('nm').value||undefined,
-          memory_mb:+document.getElementById('mem').value||4096,
+          iso:k,
+          memory_mb:+document.getElementById('mem').value||x.memory_mb||undefined,
           cpu:+document.getElementById('cpu').value||2,
-          disk_gb:+document.getElementById('disk').value||64 };
+          disk_gb:+document.getElementById('disk').value||x.disk_gb||undefined };
   jpost('/api/create',b); setTimeout(pollVMs,1500);
 }
 function act(u,name){ jpost(u,{name:name}); setTimeout(pollVMs,1200); setTimeout(pollVMs,5000); }
@@ -186,7 +205,7 @@ function runCmd(){
   con.scrollTop=con.scrollHeight;
 }
 setInterval(pollLog,1500); setInterval(pollStatus,10000); setInterval(pollVMs,6000); setInterval(pollJobs,1800);
-pollStatus(); pollVMs(); pollLog();
+pollStatus(); pollVMs(); pollLog(); loadCatalog();
 </script>
 </body>
 </html>
