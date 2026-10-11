@@ -88,6 +88,11 @@ internal static class Oobe
                 <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
                 <NetworkLocation>Work</NetworkLocation>
                 <ProtectYourPC>3</ProtectYourPC>
+                <!-- Server SKUs honour these: without them msoobe.exe stalls
+                     after its WinRE task on a host with no external network
+                     and never hands the console over to the auto-logon. -->
+                <SkipMachineOOBE>true</SkipMachineOOBE>
+                <SkipUserOOBE>true</SkipUserOOBE>
             </OOBE>
             <UserAccounts>
                 <AdministratorPassword><Value>__PASSWORD__</Value><PlainText>true</PlainText></AdministratorPassword>
