@@ -146,6 +146,20 @@ try {
           '    plain_text_passwd: "PLAINTEXTPASS"'
           "    ssh_authorized_keys: [`"$pubkey`"]"
           'ssh_pwauth: true'
+          'apt:'
+          '  http_proxy: http://192.168.50.1:8899'
+          '  https_proxy: http://192.168.50.1:8899'
+          'write_files:'
+          '  - path: /etc/profile.d/sandbox-proxy.sh'
+          '    content: |'
+          '      export http_proxy="http://192.168.50.1:8899"'
+          '      export https_proxy="http://192.168.50.1:8899"'
+          '      export no_proxy="localhost,127.0.0.1,192.168.50.0/24"'
+          '  - path: /etc/pip.conf'
+          '    content: |'
+          '      [global]'
+          '      proxy = http://192.168.50.1:8899'
+
           'runcmd:'
           '  - echo "ready $(date -Is)" > /var/lib/sandbox-ready && chmod 644 /var/lib/sandbox-ready'
         ) -join "`n"

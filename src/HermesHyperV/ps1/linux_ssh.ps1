@@ -87,7 +87,10 @@ try {
     }
     'exec' {
       $t = [int]$req.timeout_s; if ($t -le 0) { $t = 60 }
-      $r = Invoke-Ssh ([string]$req.host) ([string]$req.cmd) $t
+      # run_ps sessions inherit the egress proxy the same way the web terminal
+      # does via profile.d — so apt/pip/curl just work from automation too.
+      $envp = 'export http_proxy="http://192.168.50.1:8899" https_proxy="http://192.168.50.1:8899" no_proxy="localhost,127.0.0.1,192.168.50.0/24"; '
+      $r = Invoke-Ssh ([string]$req.host) ($envp + [string]$req.cmd) $t
       emit @{ step = 'exec'; exit = $r.exit; output = $r.output; stderr = $r.stderr; timed_out = [bool]$r.timed_out }
     }
     'ready' {
