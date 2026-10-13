@@ -112,6 +112,16 @@ public static class Api
             return Results.Json(new { log = items, n });
         });
 
+        api.MapGet("/health", async (string? name, SandboxEngine e, CancellationToken ct) =>
+        {
+            // host-side health verdict (heartbeat/KVP/Hyper-V events) — works
+            // even when the guest OS is a bugcheck loop and run_ps is dead.
+            if (string.IsNullOrWhiteSpace(name))
+                return Results.Json(new { ok = false, error = "name required" });
+            try { return Results.Json(new { ok = true, data = await e.VmHealthAsync(name, ct) }); }
+            catch (Exception ex) { return Results.Json(new { ok = false, error = ex.Message }); }
+        });
+
         return app;
     }
 

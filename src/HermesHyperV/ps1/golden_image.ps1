@@ -55,13 +55,26 @@ try {
     if (-not (Test-Path $golden)) { throw "VHD not created: $golden" }
   }
 
-  $pre = @(Get-Disk | ForEach-Object { $_.Number })
+  # Global mount lock — see child_disk.ps1: Get-Disk diff discovery is
+  # host-global, so mounts must serialize across ALL hidden child processes.
+  $script:mtx = New-Object Threading.Mutex($false, 'Global\HermesHyperVMount')
+  function Lock-Mount {
+    try { if (-not $script:mtx.WaitOne(300000)) { throw 'mount lock timeout (5 min)' } }
+    catch [Threading.AbandonedMutexException] { }   # previous holder died; lock is ours now
+  }
+  function Unlock-Mount { try { $script:mtx.ReleaseMutex() } catch {} }
+  $script:mounted = $false
   step 'mount' {
-    Mount-VHD -Path $golden | Out-Null
-    Start-Sleep 2
-    $new = @(Get-Disk | Where-Object { $pre -notcontains $_.Number })
-    if ($new.Count -ne 1) { throw "mounted disk discovery: got $($new.Count)" }
-    $script:d = $new[0].Number
+    Lock-Mount
+    try {
+      $pre = @(Get-Disk | ForEach-Object { $_.Number })
+      Mount-VHD -Path $golden | Out-Null
+      $script:mounted = $true
+      Start-Sleep 2
+      $new = @(Get-Disk | Where-Object { $pre -notcontains $_.Number })
+      if ($new.Count -ne 1) { throw "mounted disk discovery: got $($new.Count)" }
+      $script:d = $new[0].Number
+    } catch { Unlock-Mount; throw }
   }
   step 'init' { Initialize-Disk -Number $d -PartitionStyle GPT | Out-Null }
 
@@ -134,14 +147,18 @@ try {
         }
       }
     }
-    Dismount-VHD -Path $golden | Out-Null
-    Remove-Item $seed -Recurse -Force -ErrorAction SilentlyContinue
+    try {
+      Dismount-VHD -Path $golden | Out-Null
+      $script:mounted = $false
+      Remove-Item $seed -Recurse -Force -ErrorAction SilentlyContinue
+    } finally { Unlock-Mount }
   }
   $g = Get-Item $golden
   emit @{ step = 'golden'; path = $golden; size_mb = [math]::Round($g.Length / 1MB) }
 } catch {
+  try { if ($script:mounted) { Dismount-VHD -Path $golden -ErrorAction SilentlyContinue | Out-Null } } catch { }
+  try { Unlock-Mount } catch { }
   try { Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue | Out-Null } catch { }
-  try { Dismount-VHD -Path $golden -ErrorAction SilentlyContinue | Out-Null } catch { }
   $result.ok = $false
   $result.error = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
 }

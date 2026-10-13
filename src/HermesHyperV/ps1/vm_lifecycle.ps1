@@ -7,6 +7,16 @@ $global:__OUT = New-Object System.Collections.ArrayList
 function emit { param($o) $global:__OUT.Add($o) | Out-Null }
 $result = [ordered]@{ ok = $true; data = @(); error = $null }
 
+# Global mount lock — Get-Disk diff discovery is host-global, so every
+# Mount-VHD→work→Dismount in every hidden child must serialize (see
+# child_disk.ps1 for the full rationale).
+$script:mtx = New-Object Threading.Mutex($false, 'Global\HermesHyperVMount')
+function Lock-Mount {
+  try { if (-not $script:mtx.WaitOne(300000)) { throw 'mount lock timeout (5 min)' } }
+  catch [Threading.AbandonedMutexException] { }   # previous holder died; lock is ours now
+}
+function Unlock-Mount { try { $script:mtx.ReleaseMutex() } catch {} }
+
 try {
   $req = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:HV_REQ)) | ConvertFrom-Json
   $action = [string]$req.action
@@ -123,9 +133,13 @@ try {
       # seed
         if (Test-Path $seed) { Remove-Item $seed -Force }
         New-VHD -Path $seed -SizeBytes 64MB -Fixed | Out-Null
+        Lock-Mount
+        $script:seedMounted = $true
         $pre = @(Get-Disk | ForEach-Object { $_.Number })
         Mount-VHD -Path $seed | Out-Null; Start-Sleep 1
-        $d = @(Get-Disk | Where-Object { $pre -notcontains $_.Number })[0].Number
+        $newD = @(Get-Disk | Where-Object { $pre -notcontains $_.Number })
+        if ($newD.Count -ne 1) { throw "seed disk discovery: got $($newD.Count)" }
+        $d = $newD[0].Number
         Initialize-Disk -Number $d -PartitionStyle MBR | Out-Null
         $p = New-Partition -DiskNumber $d -UseMaximumSize
         Format-Volume -Partition $p -FileSystem FAT -NewFileSystemLabel 'cidata' -Confirm:$false | Out-Null
@@ -184,6 +198,8 @@ try {
         Start-Sleep 1
         Remove-PartitionAccessPath -DiskNumber $d -PartitionNumber $p.PartitionNumber -AccessPath ($m + '\')
         Dismount-VHD -Path $seed
+        $script:seedMounted = $false
+        Unlock-Mount
         Remove-Item $m -Recurse -Force -EA SilentlyContinue
       # boot: seed rides along as a second SCSI disk (NoCloud scans every
       # block device for a 'cidata' volume; a DVD slot would reject vhdx media)
@@ -273,11 +289,31 @@ try {
             try { $lip = [string]((Get-Content $meta -Raw | ConvertFrom-Json).ip) } catch { }
           }
         }
+        # Host-side proof the guest OS ever booted: the KVP exchange caches
+        # what Windows' integration components reported (OSName etc). Empty
+        # after a long uptime = no OS ever took over (boot screen / WinRE);
+        # present but heartbeat dark = OS was in, then crashed away from us.
+        $osReported = ''
+        if (-not $linux) {
+          try {
+            $cs = Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem `
+                  -Filter "ElementName='$($_.VMName)'" -ErrorAction Stop
+            $kvp = Get-CimAssociatedInstance -InputObject $cs -Association Msvm_SystemDevice `
+                   -ResultClassName Msvm_KvpExchangeComponent -ErrorAction Stop
+            foreach ($item in @($kvp.GuestIntrinsicExchangeItems)) {
+              $x = [xml]$item
+              $nm = ($x.SelectNodes('/INSTANCE/PROPERTY') | Where-Object { $_.Name -eq 'Name' }).Value
+              if ($nm -eq 'OSName') {
+                $osReported = [string](($x.SelectNodes('/INSTANCE/PROPERTY') | Where-Object { $_.Name -eq 'Data' }).Value)
+              }
+            }
+          } catch { }
+        }
         emit @{
           name=$_.VMName; state=[string]$_.State; cpu_count=$_.ProcessorCount
           mem_mb=[math]::Round($_.MemoryAssigned/1MB); uptime=[string]$_.Uptime
           heartbeat=[string]$_.Heartbeat; ips=$ips
-          linux=$linux; ip=$lip
+          linux=$linux; ip=$lip; os_reported=$osReported
         }
       }
     }
@@ -294,9 +330,31 @@ try {
       emit @{ state=$state; reached=($state -eq $want) }
     }
 
+    'diag' {
+      # Recent Hyper-V worker/VMMS events mentioning this VM — crash/power
+      # events that explain a dark heartbeat. Worker logs key events by VM
+      # GUID, VMMS by name — match both. Read-only, fast.
+      $name=[string]$req.name
+      $mins=[int]$req.minutes; if ($mins -le 0) { $mins = 60 }
+      $cut=(Get-Date).AddMinutes(-$mins)
+      $guid=''
+      try { $guid=[string](Get-VM -Name $name -ErrorAction Stop).Id } catch { }
+      $pat=[regex]::Escape($name) + $(if ($guid) { '|' + [regex]::Escape($guid) } else { '' })
+      $events=@()
+      foreach ($log in 'Microsoft-Windows-Hyper-V-Worker-Admin','Microsoft-Windows-Hyper-V-VMMS-Admin','Microsoft-Windows-Hyper-V-VmSwitch-Admin') {
+        $events += @(Get-WinEvent -FilterHashtable @{LogName=$log; StartTime=$cut} -MaxEvents 4000 -ErrorAction SilentlyContinue |
+          Where-Object { $_.Message -match $pat } |
+          ForEach-Object { @{ t=$_.TimeCreated.ToString('s'); log=$_.LogName.Split('.')[-2]; id=$_.Id; level=$_.LevelDisplayName;
+                              msg=(($_.Message -replace "[\r\n]+",' ') -replace '\s+',' ') } })
+      }
+      emit @{ name=$name; guid=$guid; events=($events | Sort-Object t | Select-Object -Last 30) }
+    }
+
     default { throw "unknown action '$action'" }
   }
 } catch {
+  try { if ($script:seedMounted) { Dismount-VHD -Path $seed -ErrorAction SilentlyContinue | Out-Null } } catch { }
+  try { Unlock-Mount } catch { }
   $result.ok = $false
   $result.error = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
 }

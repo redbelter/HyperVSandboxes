@@ -22,12 +22,21 @@ try {
     New-VHD -Path $tmp -SizeBytes $size -Fixed | Out-Null
     if (-not (Test-Path $tmp)) { throw 'fixed vhdx not created' }
 
-  # raw -> physical drive
+  # raw -> physical drive  (global mount lock: a concurrent mount elsewhere
+  # would see THIS disk in its Get-Disk diff — see child_disk.ps1)
+    $script:mtx = New-Object Threading.Mutex($false, 'Global\HermesHyperVMount')
+    function Lock-Mount {
+      try { if (-not $script:mtx.WaitOne(300000)) { throw 'mount lock timeout (5 min)' } }
+      catch [Threading.AbandonedMutexException] { }
+    }
+    function Unlock-Mount { try { $script:mtx.ReleaseMutex() } catch {} }
+    Lock-Mount
+    try {
     $pre = @(Get-Disk | ForEach-Object { $_.Number })
     Mount-VHD -Path $tmp -ErrorAction Stop | Out-Null
     Start-Sleep 1
-    $d = @(Get-Disk | Where-Object { $pre -notcontains $_.Number })[0]
-    if (-not $d) { throw 'mounted golden vhdx not visible' }
+    $d = @(Get-Disk | Where-Object { $pre -notcontains $_.Number })
+    $d = if ($d.Count -eq 1) { $d[0] } else { throw "mounted disk discovery: got $($d.Count)" }
     $dn = [int]$d.Number
     try {
       Set-Disk -Number $dn -IsOffline $true -EA Stop
@@ -55,12 +64,14 @@ try {
     Mount-VHD -Path $tmp -ReadOnly -ErrorAction Stop | Out-Null
     Start-Sleep 1
     try {
-      $d2 = @(Get-Disk | Where-Object { $pre2 -notcontains $_.Number })[0]
-      if (-not $d2) { throw 'golden vhdx not visible on verify mount' }
+      $d2 = @(Get-Disk | Where-Object { $pre2 -notcontains $_.Number })
+      if ($d2.Count -ne 1) { throw "verify mount discovery: got $($d2.Count)" }
+      $d2 = $d2[0]
       $np = @(Get-Partition -DiskNumber $d2.Number -EA SilentlyContinue).Count
       if ($np -lt 1) { throw 'no partitions visible in golden vhdx (write suspect)' }
       emit @{ partitions = $np; host_size = $d2.Size }
     } finally { Dismount-VHD -Path $tmp -ErrorAction SilentlyContinue }
+    } finally { Unlock-Mount }
 
   Move-Item $tmp $vhd -Force
   emit @{ vhd = $vhd; bytes = $size }

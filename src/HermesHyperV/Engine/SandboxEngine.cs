@@ -125,6 +125,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             var o = JsonSerializer.Deserialize<Dictionary<string, object?>>(vm.GetRawText())!;
             o["phase"] = Phase(vm);
             var nm = vm.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+            o["stuck"] = StuckOf(nm);
             var credFile = Path.Combine(VmDir, nm, "creds.json");
             if (nm.Length > 0 && File.Exists(credFile))
             {
@@ -146,13 +147,213 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         if (state != "Running") return "Off";
         var linux = vm.TryGetProperty("linux", out var lz) && lz.GetBoolean();
         var hb = vm.TryGetProperty("heartbeat", out var h) ? h.GetString() ?? "" : "";
+        var name = vm.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
         // Linux guests have no Hyper-V IC, so heartbeat never leaves Unknown;
         // their readiness signal alone is the ssh marker (ReadyCache).
-        if (!linux && !hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase)) return "Installing";
+        if (!linux && !hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase))
+        {
+            // Heartbeat dark while Hyper-V insists it's Running. A guest that
+            // bugchecks into WinRE keeps its worker process alive (uptime
+            // climbs, state stays Running) while the OS never answers — from
+            // the host that is indistinguishable from a slow install UNLESS we
+            // watch. Watch knows: OS-reported-in-once + dark = it crashed out
+            // (likely WinRE/BSOD loop); never-reported + dark past budget =
+            // stuck pre-OS (boot screen, WinRE, corrupt disk).
+            return Watch.Verdict(name) != null ? "Stuck" : "Installing";
+        }
         // Heartbeat Ok only means the kernel/ICs respond. Honest 'Ready' =
         // desktop actually logged on (ready.txt seen by the readiness prober).
-        var name = vm.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
         return ReadyCache.ContainsKey(name) ? "Ready" : "Installing";
+    }
+
+    /// <summary>Full human sentence behind a 'Stuck' phase (null when healthy/inside budget).</summary>
+    public static string? StuckOf(string name) => Watch.Verdict(name);
+
+    /// <summary>
+    /// Host-side health verdict for a VM: the list-row signals (heartbeat,
+    /// KVP OS report, uptime) plus recent Hyper-V worker/VMMS events. Cheap
+    /// enough for the dashboard to poll; the honest answer to "is this guest
+    /// actually alive, or is it bugchecking in a circle?".
+    /// </summary>
+    public async Task<JsonElement> VmHealthAsync(string name, CancellationToken ct = default)
+    {
+        var vm = await VmStatusAsync(name, ct);
+        var nm = vm.GetProperty("name").GetString()!;
+        var ev = await ps.RunScriptAsync("vm_lifecycle",
+            new { action = "diag", name = nm, minutes = 60 }, 60, ct);
+        var events = ev.Ok && ev.First is { } f && f.TryGetProperty("events", out var e)
+            ? e.EnumerateArray().Take(10).ToArray() : Array.Empty<JsonElement>();
+        Watch.Touch(nm, vm);
+        return JsonSerializer.SerializeToElement(new
+        {
+            vm = nm,
+            state = vm.TryGetProperty("state", out var s) ? s.GetString() : null,
+            heartbeat = vm.TryGetProperty("heartbeat", out var h) ? h.GetString() : null,
+            phase = Phase(vm),
+            diagnosis = Watch.Verdict(nm) ?? Watch.LastDiagnosis(nm),
+            os_reported = Watch.OsReported(nm),
+            uptime = vm.TryGetProperty("uptime", out var u) ? u.GetString() : null,
+            linux = vm.TryGetProperty("linux", out var lz) && lz.GetBoolean(),
+            recent_events = events,
+        });
+    }
+
+    /// <summary>
+    /// Tracks what the HOST can see per VM (heartbeat transitions, KVP "the
+    /// guest OS introduced itself" cache — which outlives this service).
+    /// Produces honest verdicts instead of an eternal 'Installing' when the
+    /// guest is really stuck at a pre-desktop screen (WinRE, BSOD, boot
+    /// prompt). Pure inference from signals Hyper-V exposes; no guest access
+    /// needed, so it works while run_ps is dead.
+    /// </summary>
+    internal static class Watch
+    {
+        public const int BootBudgetMin = 15;   // never-OS-reported past this = stuck pre-OS
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> EverOk = new();
+        // Guest-shell (PS Direct) liveness: last success and last transport-level
+        // death ("socket target process has ended" = VMGS/PowerShell gone while
+        // the worker still runs — the WinRE / WinPE / BSOD-screen signature).
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> ExecOkAt = new();
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> ExecBadAt = new();
+
+        public static void MarkExecOk(string name) => ExecOkAt[name] = DateTime.UtcNow;
+        public static void MarkExecBad(string name) => ExecBadAt[name] = DateTime.UtcNow;
+        public static void ClearAll()
+        {
+            EverOk.Clear(); ExecOkAt.Clear(); ExecBadAt.Clear();
+            LastRaw.Clear(); LastSeenDark.Clear(); LastSeenDiag.Clear(); DarkSince.Clear();
+        }
+        public static void Forget(string name)
+        {
+            EverOk.TryRemove(name, out _); ExecOkAt.TryRemove(name, out _); ExecBadAt.TryRemove(name, out _);
+            LastRaw.TryRemove(name, out _); LastSeenDark.TryRemove(name, out _);
+            LastSeenDiag.TryRemove(name, out _); DarkSince.TryRemove(name, out _);
+        }
+
+        public static void Touch(string name, JsonElement vm)
+        {
+            var hb = vm.TryGetProperty("heartbeat", out var h) ? h.GetString() ?? "" : "";
+            if (hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase))
+                EverOk.TryAdd(name, DateTime.UtcNow);
+        }
+
+        /// <summary>
+        /// Called for every Running VM row every poll: maintains dark-since
+        /// timers, caches the raw signals Verdict() reasons over, and blogs
+        /// health transitions once (dark->stuck, dark->recovered) so the
+        /// activity feed tells the human before they have to ask.
+        /// </summary>
+        public static void Observe(string name, JsonElement vm, JobStore jobs)
+        {
+            var hb = vm.TryGetProperty("heartbeat", out var h) ? h.GetString() ?? "" : "";
+            var st = vm.TryGetProperty("state", out var s) ? s.GetString() : null;
+            if (st != "Running") { LastRaw.TryRemove(name, out _); DarkSince.TryRemove(name, out _); return; }
+            var linux = vm.TryGetProperty("linux", out var lz) && lz.GetBoolean();
+            double upMin = 0;
+            if (vm.TryGetProperty("uptime", out var u) &&
+                TimeSpan.TryParse(u.GetString(), out var up)) upMin = up.TotalMinutes;
+            var reported = vm.TryGetProperty("os_reported", out var or) &&
+                           !string.IsNullOrEmpty(or.GetString());
+            var darkOk = hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase);
+            var dark = TimeSpan.Zero;
+            if (linux)
+            {
+                // No heartbeat IC on Linux guests — no darkness concept.
+            }
+            else if (!darkOk)
+            {
+                var now = DateTime.UtcNow;
+                var since = DarkSince.GetOrAdd(name, now);
+                dark = now - since;
+            }
+            else
+            {
+                DarkSince.TryRemove(name, out _);   // only a live heartbeat ends darkness
+                darkOk = true;
+            }
+            LastRaw[name] = (linux, upMin, reported, dark);
+            if (darkOk)
+            {
+                Touch(name, vm);
+                var prev = Watch.LastSeenDiag.GetOrAdd(name, "healthy");
+                if (prev != "healthy")
+                {
+                    LastSeenDiag[name] = "healthy";
+                    jobs.Blog($"{name}: heartbeat recovered", "ready");
+                }
+                return;
+            }
+            // shell gone = guest fell out of a usable OS; revoke stale readiness
+            if (!linux && Watch.ShellGone(name))
+            {
+                if (ReadyCache.TryRemove(name, out _))
+                    jobs.Blog($"{name}: readiness revoked — guest shell unreachable (WinRE?)", "warn");
+            }
+            var verdict = Verdict(name);
+            if (verdict != null)
+            {
+                LastSeenDark[name] = verdict;
+                if (Watch.LastSeenDiag.GetOrAdd(name, "") != verdict)
+                {
+                    LastSeenDiag[name] = verdict;
+                    jobs.Blog($"{name}: {verdict}", "warn");
+                }
+            }
+        }
+
+        /// <summary>Verdict while the VM looks unhealthy; null = healthy/still-booting.</summary>
+        public static string? Verdict(string name)
+        {
+            if (!LastRaw.TryGetValue(name, out var raw)) return null;
+            var (linux, upMin, reported, dark) = raw;
+            if (linux) return null;
+            var kernelAlive = dark <= TimeSpan.FromSeconds(90);   // heartbeat flicker grace
+            if (kernelAlive)
+            {
+                // Heartbeat beats (kernel ICs answer — they do in WinRE too), but the
+                // guest SHELL (VMGS/PowerShell, what run_ps rides) has been dead for
+                // minutes after having worked once. That split is WinRE/WinPE/BSOD-screen.
+                if (ShellGone(name))
+                    return "Guest kernel answers but the guest shell is unreachable (PS Direct socket dead) — classic WinRE / WinPE / BSOD-screen state";
+                return null;   // healthy or still inside boot budget
+            }
+            if (EverOk.ContainsKey(name))
+                return "Lost contact — the guest OS booted, then went silent (bugcheck / WinRE / crash loop)";
+            if (reported)
+                return "OS reported in once, now silent — likely crashed to WinRE";
+            if (upMin >= BootBudgetMin)
+                return $"OS never reported in {upMin:N0} min (boot budget {BootBudgetMin}) — stuck at boot screen / WinRE / corrupt boot disk";
+            return null;   // still inside the boot budget — 'Installing' is honest
+        }
+
+        /// <summary>Shell dead >2 min. Two evidence paths: (a) exec worked once
+        /// and now transport-dies — unambiguous; (b) service restarted (no exec
+        /// history here), so fall back to the host-cached KVP report + boot
+        /// budget: the OS introduced itself long ago yet its shell has never
+        /// answered here → it isn't sitting at a shell at all.</summary>
+        public static bool ShellGone(string name)
+        {
+            var ok = ExecOkAt.TryGetValue(name, out var o) ? o : DateTime.MinValue;
+            var bad = ExecBadAt.TryGetValue(name, out var b) ? b : DateTime.MinValue;
+            if (bad == DateTime.MinValue || DateTime.UtcNow - bad <= TimeSpan.FromMinutes(2)) return false;
+            if (ok > DateTime.MinValue) return true;
+            if (LastRaw.TryGetValue(name, out var raw) && raw.reported && raw.upMin >= BootBudgetMin)
+                return true;
+            return false;
+        }
+
+        public static string LastDiagnosis(string name) =>
+            LastSeenDark.TryGetValue(name, out var v) ? v : "healthy";
+
+        public static bool OsReported(string name) =>
+            LastRaw.TryGetValue(name, out var raw) && raw.reported;
+
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> LastSeenDiag = new();
+
+        // (linux, uptimeMinutes, osEverReportedToHost, darkSince — zero if heartbeat currently Ok)
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (bool linux, double upMin, bool reported, TimeSpan dark)> LastRaw = new();
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> LastSeenDark = new();
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> DarkSince = new();
     }
 
     /// <summary>
@@ -163,6 +364,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     internal sealed class ReadinessProber(SandboxEngine engine, JobStore jobs,
         ILogger<ReadinessProber> log) : BackgroundService
     {
+        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> KeepAliveAt = new();
         const string Probe =
             "if (Test-Path C:\\Sandbox\\ready.txt) { Get-Content C:\\Sandbox\\ready.txt } " +
             "else { 'NOT-YET' }";
@@ -180,8 +382,29 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
                         var st = vm.TryGetProperty("state", out var s2) ? s2.GetString() : null;
                         var linux = vm.TryGetProperty("linux", out var lz) && lz.GetBoolean();
                         if (st != "Running") continue;
+                        // host-side health watch runs for EVERY running row
+                        // (heartbeat transitions, WinRE/BSOD-loop verdicts)
+                        Watch.Observe(name, vm, jobs);
                         if (!linux && !hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase)) continue;
-                        if (ReadyCache.ContainsKey(name)) continue;
+                        // Ready VMs still need a liveness pulse: a guest that
+                        // silently rebooted into WinRE looks identical from the
+                        // host (heartbeat Ok, uptime monotonic) until someone
+                        // touches the exec channel. Throttle to ~every 30s/VM.
+                        if (ReadyCache.ContainsKey(name))
+                        {
+                            var last = KeepAliveAt.TryGetValue(name, out var l) ? l : DateTime.MinValue;
+                            if (DateTime.UtcNow - last < TimeSpan.FromSeconds(30)) continue;
+                            KeepAliveAt[name] = DateTime.UtcNow;
+                            try
+                            {
+                                if (linux)
+                                    await engine.RunLinuxSshAsync(name, "cat /var/lib/sandbox-ready", 30, ct);
+                                else
+                                    await engine.RunPsAsync(name, Probe, 30, ct: ct);
+                            }
+                            catch { /* failure is enough — NoteExec already marked it */ }
+                            continue;
+                        }
                         try
                         {
                             var r = linux
@@ -317,6 +540,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     {
         var vmName = CheckName(name);
         ReadyCache.TryRemove(vmName, out _);   // fresh VM = no stale readiness
+        Watch.Forget(vmName);                  // ...or stale health history
         var path = FindIso(iso);
         IsoEntry? cat = null;
         if (edition is null)
@@ -596,6 +820,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             oobe = Path.Combine(MediaDir, $"{full}-oobe.xml"),
         }, 300, ct);
         ReadyCache.TryRemove(full, out _);
+        Watch.Forget(full);
         return r;
     }
 
@@ -603,7 +828,21 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     {
         var r = await Run1("vm_lifecycle", new { action = "purge", tag = cfg.Tag, vmroot = VmDir, media = MediaDir }, 600, ct);
         ReadyCache.Clear();
+        Watch.ClearAll();
         return r;
+    }
+
+    /// <summary>Classify a PS-Direct failure: transport death (VMGS/PowerShell
+    /// gone → WinRE/WinPE/screen) vs guest-side errors (bad command, access
+    /// denied) which say nothing about OS liveness.</summary>
+    static void NoteExec(string vm, string err)
+    {
+        err = err ?? "";
+        if (err.Contains("socket", StringComparison.OrdinalIgnoreCase) ||
+            err.Contains("Transport", StringComparison.OrdinalIgnoreCase) ||
+            err.Contains("session might have ended", StringComparison.OrdinalIgnoreCase) ||
+            err.Contains("timed out", StringComparison.OrdinalIgnoreCase))
+            Watch.MarkExecBad(vm);
     }
 
     /// <summary>PowerShell Direct into the guest (VMBus — works without network).</summary>
@@ -613,15 +852,21 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         var full = CheckName(name);
         if (IsLinuxVm(full)) return await RunLinuxSshAsync(full, command, timeoutSec, ct);
         var cmdB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(command));
-        var r = await ps.RunScriptAsync("guest_exec", new
+        PsResult r;
+        try
         {
-            vm = full, script_b64 = cmdB64,
-            user = user ?? GuestDefaults.User,
-            password = password ?? GuestDefaults.Password,
-            timeout = timeoutSec,
-        }, timeoutSec + 90, ct);
-        if (!r.Ok) throw new InvalidOperationException(r.Error ?? "guest exec failed");
+            r = await ps.RunScriptAsync("guest_exec", new
+            {
+                vm = full, script_b64 = cmdB64,
+                user = user ?? GuestDefaults.User,
+                password = password ?? GuestDefaults.Password,
+                timeout = timeoutSec,
+            }, timeoutSec + 90, ct);
+        }
+        catch (Exception ex) { NoteExec(full, ex.Message); throw; }
+        if (!r.Ok) { NoteExec(full, r.Error ?? "guest exec failed"); throw new InvalidOperationException(r.Error ?? "guest exec failed"); }
         var first = r.First ?? throw new InvalidOperationException("guest exec emitted nothing");
+        Watch.MarkExecOk(full);
         var wrapped = first.TryGetProperty("output", out var o) ? o.GetString() : null;
         var timedOut = first.TryGetProperty("timed_out", out var t) && t.GetBoolean();
         return JsonSerializer.SerializeToElement(new

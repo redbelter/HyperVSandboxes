@@ -37,6 +37,15 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
         return AddPhase(vm);
     }
 
+    [McpServerTool, Description(
+        "Health verdict for one sandbox VM from HOST-SIDE signals: heartbeat, KVP " +
+        "OS self-report, uptime, recent Hyper-V worker/VMMS events. Use when a VM " +
+        "is Running but never Ready or run_ps keeps failing — the diagnosis names " +
+        "the likely state (still installing / crashed out of a booted OS / stuck " +
+        "at boot screen or WinRE). Works even when the guest OS is down.")]
+    public Task<JsonElement> Vm_health(string name, CancellationToken ct) =>
+        engine.VmHealthAsync(name, ct);
+
     [McpServerTool, Description("List Windows editions inside an ISO (catalog name, file in C:\\HyperV\\Media, or absolute path).")]
     public Task<JsonElement> List_editions(string iso, CancellationToken ct) =>
         engine.ListEditionsAsync(iso, ct);

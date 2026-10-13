@@ -44,26 +44,41 @@ try {
     if (-not (Test-Path $vhd)) { throw "child VHD not created: $vhd" }
   }
 
-  $pre = @(Get-Disk | ForEach-Object { $_.Number })
-  $script:d = $null; $script:osPart = $null
+
+  # One system-wide lock around 'pre-snapshot + Mount-VHD + Get-Disk diff +
+  # work + Dismount': disk discovery is host-global, so two concurrent
+  # creates must not interleave mounts (the other's disk shows up in my
+  # diff, 'got 2', or worse I pick the wrong Number).
+  $script:mtx = New-Object Threading.Mutex($false, 'Global\HermesHyperVMount')
+  function Lock-Mount {
+    try { if (-not $script:mtx.WaitOne(300000)) { throw 'mount lock timeout (5 min)' } }
+    catch [Threading.AbandonedMutexException] { }   # previous holder died; lock is ours now
+  }
+  function Unlock-Mount { try { $script:mtx.ReleaseMutex() } catch {} }
+  $script:d = $null; $script:osPart = $null; $script:mounted = $false
   step 'mount' {
-    Mount-VHD -Path $vhd | Out-Null
-    Start-Sleep 2
-    $new = @(Get-Disk | Where-Object { $pre -notcontains $_.Number })
-    if ($new.Count -ne 1) { throw "mounted disk discovery: got $($new.Count)" }
-    $script:d = $new[0].Number
-    $osM = Join-Path $seed 'os'
-    New-Item -ItemType Directory -Force -Path $osM | Out-Null
-    # the OS partition is the one carrying \Windows
-    foreach ($p in @(Get-Partition -DiskNumber $d | Where-Object { $_.Size -gt 1GB })) {
-      Add-PartitionAccessPath -DiskNumber $d -PartitionNumber $p.PartitionNumber -AccessPath ($osM + '\') -ErrorAction SilentlyContinue
-      if (Test-Path (Join-Path $osM 'Windows')) {
-        $script:osPart = $p.PartitionNumber
-        break
+    Lock-Mount
+    try {
+      $pre = @(Get-Disk | ForEach-Object { $_.Number })
+      Mount-VHD -Path $vhd | Out-Null
+      $script:mounted = $true
+      Start-Sleep 2
+      $new = @(Get-Disk | Where-Object { $pre -notcontains $_.Number })
+      if ($new.Count -ne 1) { throw "mounted disk discovery: got $($new.Count)" }
+      $script:d = $new[0].Number
+      $osM = Join-Path $seed 'os'
+      New-Item -ItemType Directory -Force -Path $osM | Out-Null
+      # the OS partition is the one carrying \Windows
+      foreach ($p in @(Get-Partition -DiskNumber $d | Where-Object { $_.Size -gt 1GB })) {
+        Add-PartitionAccessPath -DiskNumber $d -PartitionNumber $p.PartitionNumber -AccessPath ($osM + '\') -ErrorAction SilentlyContinue
+        if (Test-Path (Join-Path $osM 'Windows')) {
+          $script:osPart = $p.PartitionNumber
+          break
+        }
+        Remove-PartitionAccessPath -DiskNumber $d -PartitionNumber $p.PartitionNumber -AccessPath ($osM + '\') -ErrorAction SilentlyContinue
       }
-      Remove-PartitionAccessPath -DiskNumber $d -PartitionNumber $p.PartitionNumber -AccessPath ($osM + '\') -ErrorAction SilentlyContinue
-    }
-    if (-not $osPart) { throw 'OS partition not found on child disk' }
+      if (-not $osPart) { throw 'OS partition not found on child disk' }
+    } catch { Unlock-Mount; throw }
   }
   step 'panther' {
     $panther = Join-Path (Join-Path $seed 'os') 'Windows\Panther'
@@ -72,14 +87,18 @@ try {
     if (-not (Test-Path (Join-Path $panther 'unattend.xml'))) { throw 'panther copy missing' }
   }
   step 'dismount' {
-    Remove-PartitionAccessPath -DiskNumber $d -PartitionNumber $osPart -AccessPath ((Join-Path $seed 'os') + '\') -ErrorAction SilentlyContinue
-    Dismount-VHD -Path $vhd | Out-Null
-    Remove-Item $seed -Recurse -Force -ErrorAction SilentlyContinue
+    try {
+      Remove-PartitionAccessPath -DiskNumber $d -PartitionNumber $osPart -AccessPath ((Join-Path $seed 'os') + '\') -ErrorAction SilentlyContinue
+      Dismount-VHD -Path $vhd | Out-Null
+      $script:mounted = $false
+      Remove-Item $seed -Recurse -Force -ErrorAction SilentlyContinue
+    } finally { Unlock-Mount }
   }
   $c = Get-Item $vhd
   emit @{ step = 'child-disk'; vhd = $vhd; size_mb = [math]::Round($c.Length / 1MB) }
 } catch {
-  try { Dismount-VHD -Path $vhd -ErrorAction SilentlyContinue | Out-Null } catch { }
+  try { if ($script:mounted) { Dismount-VHD -Path $vhd -ErrorAction SilentlyContinue | Out-Null } } catch { }
+  try { Unlock-Mount } catch { }
   $result.ok = $false
   $result.error = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
 }

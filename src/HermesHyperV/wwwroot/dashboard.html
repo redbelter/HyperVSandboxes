@@ -32,6 +32,8 @@
   .chip { font-size:10px; padding:1px 8px; border-radius:99px; border:1px solid var(--border); color:var(--dim); white-space:nowrap; }
   .chip.Ready { color:var(--ok); border-color:var(--ok); }
   .chip.Installing { color:var(--warn); border-color:var(--warn); }
+  .chip.Stuck { color:var(--err); border-color:var(--err); }
+  .vm .stucknote { color:var(--err); font-size:11px; margin:-2px 0 4px; }
   .vm .meta { color:var(--dim); font-size:11px; margin:6px 0; }
   .vm .acts { display:flex; gap:6px; flex-wrap:wrap; }
   .vm .acts button { padding:2px 8px; font-size:11px; }
@@ -167,15 +169,17 @@ function renderVMs(data){
     var ready=v.phase==='Ready', lin=v.linux===true;
     // phase comes from the engine (guest marker confirmed), NOT from Hyper-V's
     // ip inventory — Linux guests never populate it (no guest agent).
-    var chipTxt = v.state!=='Running' ? v.state : (v.phase==='Ready'?'Ready':v.phase==='Off'?'Off':'installing…');
+    var chipTxt = v.state!=='Running' ? v.state : (v.phase==='Ready'?'Ready':v.phase==='Stuck'?'stuck':v.phase==='Off'?'Off':'installing…');
     var ip = v.ip || (v.ips&&v.ips.length ? v.ips[0] : null);
     var ci = vmCache.indexOf(v);
     var creds = v.guest_user ? ('<div class="creds">login <b title="click to copy user:password" onclick="cpw('+ci+')">'+esc(v.guest_user)+(v.guest_password?' / '+esc(v.guest_password):'')+'</b>'+
                   (lin&&ip?' · ssh '+esc(v.guest_user)+'@'+esc(ip):'')+'</div>') : '';
+    var stuck = v.stuck ? '<div class="stucknote">'+esc(v.stuck)+'</div>' : '';
     return '<div class="vm'+(v.name===selName?' sel':'')+'" onclick="selectVM(\''+esc(v.name)+'\')"><div class="hd"><b>'+esc(v.name)+(lin?' <span class="chip">debian</span>':'')+'</b><span class="chip '+v.phase+'">'+esc(chipTxt)+'</span></div>'+
-      '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(ip?esc(ip):(v.state==='Running'?'no IP yet (installing / network idle)':'—'))+'</div>'+creds+
+      '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(ip?esc(ip):(v.state==='Running'?'no IP yet (installing / network idle)':'—'))+'</div>'+stuck+creds+
       '<div class="acts"><button '+(ready?'':'disabled ')+'onclick="event.stopPropagation();pick(\''+esc(v.name)+'\','+(lin?'true':'false')+')">'+(lin?'command':'powershell')+'</button>'+
       (lin?'<button '+(ready?'':'disabled ')+'onclick="event.stopPropagation();termGo(\''+esc(v.name)+'\')">terminal</button>':'')+
+      (!ready&&v.state==='Running'&&!lin?'<button onclick="event.stopPropagation();diag(\''+esc(v.name)+'\')">diagnose</button>':'')+
       '<button '+(v.state==='Running'?'':'disabled ')+'onclick="event.stopPropagation();act(\'/api/start\',\''+esc(v.name)+'\')" '+(v.state==='Running'?'style=display:none':'')+'>start</button>'+
       '<button '+(v.state==='Running'?'':'disabled ')+'onclick="event.stopPropagation();act(\'/api/stop\',\''+esc(v.name)+'\')" '+(v.state!=='Running'?'style=display:none':'')+'>stop</button>'+
       '<button class="danger" onclick="event.stopPropagation();act(\'/api/delete\',\''+esc(v.name)+'\')">delete</button></div></div>';
@@ -269,7 +273,7 @@ function syncConsole(){
   } else {
     t='<button class="tab'+(selMode==='ps'?' on':'')+'" onclick="setMode(\'ps\')">PowerShell Direct</button>';
   }
-  if(!ready) t+='<span class="flabel">console unlocks when the guest is Ready ('+esc(v.phase)+')</span>';
+  if(!ready) t+='<span class="flabel">'+(v.stuck?esc(v.stuck):'console unlocks when the guest is Ready ('+esc(v.phase)+')')+'</span>';
   tabs.innerHTML=t;
   var termMode = v.linux && selMode==='term';
   paneTerm.style.display = termMode ? '' : 'none';
@@ -292,6 +296,26 @@ function cpw(i){
   var c=document.getElementById('con');
   c.innerHTML += '<div class="dim">copied ' + esc(v.guest_user) + ' credentials to clipboard</div>';
 }
+function diag(n){
+  // host-side health report — heartbeat/KVP/events, works with the guest down
+  var c=document.getElementById('con');
+  c.innerHTML += '<div class="pmt">diagnosing '+esc(n)+' (host-side signals)…</div>';
+  selName=n; renderVMsSafe();
+  fetch('/api/health?name='+encodeURIComponent(n)).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){ c.innerHTML+='<div class="err">diagnosis failed: '+esc(d.error)+'</div>'; return; }
+    var h=d.data;
+    c.innerHTML+='<div class="'+(h.phase==='Stuck'?'err':'dim')+'">health: '+esc(h.state)+
+      ' · heartbeat '+esc(h.heartbeat||'—')+' · '+esc(h.diagnosis||'healthy')+
+      (h.os_reported?' · guest OS self-reported: yes':' · guest OS never self-reported')+
+      (h.linux?' · debian':'')+'</div>';
+    var ev=h.recent_events||[];
+    if(ev.length){
+      c.innerHTML+='<div class="dim">recent Hyper-V events:</div>';
+      ev.forEach(function(e){ c.innerHTML+='<div class="dim" style="padding-left:12px">'+esc(e.t.slice(11))+' ['+esc(e.level)+'] '+esc(e.msg.slice(0,150))+'</div>'; });
+    } else c.innerHTML+='<div class="dim">no Hyper-V events for this VM in the last hour.</div>';
+  });
+}
+function renderVMsSafe(){ try{ if(vmCache.length) renderVMs({vms:vmCache}); }catch(e){} }
 function runCmd(){
   var n=selName, c=document.getElementById('cmd').value.trim();
   if(!n||!c) return;
