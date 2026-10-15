@@ -134,6 +134,34 @@ try {
     Remove-Item (Join-Path $dir 'dism.log'),(Join-Path $dir 'dism.out'),(Join-Path $dir 'dism.err') -ErrorAction SilentlyContinue
   }
   step 'unmountiso' { Dismount-DiskImage -ImagePath $iso | Out-Null }
+  step 'stub-wlms' {
+    # EVAL editions force-reboot hourly once the license expires: wlms.exe
+    # triggers winlogon 1074 'Upgrade (Planned)' restarts that kill guest
+    # tasks mid-run (observed on Server-2025-EVAL and Win11-ENT-26H2-EVAL
+    # goldens — children lived ~1h max). Sandboxes never need license
+    # enforcement, so overwrite wlms.exe with a no-op exe UNCONDITIONALLY.
+    # robocopy /B (backup mode) writes through the TrustedInstaller DACL via
+    # SeBackupPrivilege — plain Copy-Item and offline-registry edits both
+    # fail 'Access is denied' even as SYSTEM-elevated admin.
+    $wlDir = Join-Path $osM 'Windows\System32\wlms'
+    $wl = Join-Path $wlDir 'wlms.exe'
+    if (Test-Path $wl) {
+      # robocopy selects files BY NAME from the source dir, so the stub must
+      # be literally named wlms.exe there (golden dir; deleted right after).
+      $stub = Join-Path $dir 'wlms.exe'
+      Copy-Item (Join-Path $env:windir 'System32\where.exe') $stub -Force
+      robocopy.exe $dir $wlDir wlms.exe /B /IS /NFL /NDL /NJH /NJS | Out-Null
+      # robocopy: 0-7 are success codes (1 = file copied)
+      if ($LASTEXITCODE -ge 8) { Remove-Item $stub -Force -EA SilentlyContinue; throw "wlms stub robocopy exit $LASTEXITCODE" }
+      $want = (Get-FileHash $stub -Algorithm SHA256).Hash
+      $have = (Get-FileHash $wl -Algorithm SHA256).Hash
+      Remove-Item $stub -Force -ErrorAction SilentlyContinue
+      if ($want -ne $have) { throw "wlms stub not on disk after write (hash mismatch)" }
+      emit @{ step = 'stub-wlms'; stubbed = $true; size = (Get-Item $wl).Length }
+    } else {
+      emit @{ step = 'stub-wlms'; stubbed = $false; why = 'wlms.exe not in image' }
+    }
+  }
   step 'bcdboot' {
     $p = Start-Process -FilePath "$env:windir\System32\bcdboot.exe" -ArgumentList @(
       ($osM + '\Windows'), '/s', ($sysM + '\'), '/f', 'UEFI' ) -Wait -PassThru -WindowStyle Hidden
