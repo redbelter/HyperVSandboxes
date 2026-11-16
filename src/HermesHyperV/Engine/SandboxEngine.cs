@@ -14,7 +14,7 @@ public sealed record SandboxSettings(string Root = @"C:\HyperV",
 /// child running an embedded script (PowerShellRunner) — the service itself
 /// is LocalSystem so there is no elevation inbox and zero visible windows.
 /// </summary>
-public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILogger<SandboxEngine> log)
+public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILogger<SandboxEngine> log)
 {
     public string VmDir => Path.Combine(cfg.Root, "VMs");
 
@@ -245,12 +245,12 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     internal static class Watch
     {
         public const int BootBudgetMin = 15;   // never-OS-reported past this = stuck pre-OS
-        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> EverOk = new();
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> EverOk = new();
         // Guest-shell (PS Direct) liveness: last success and last transport-level
         // death ("socket target process has ended" = VMGS/PowerShell gone while
         // the worker still runs — the WinRE / WinPE / BSOD-screen signature).
-        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> ExecOkAt = new();
-        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> ExecBadAt = new();
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> ExecOkAt = new();
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> ExecBadAt = new();
 
         public static void MarkExecOk(string name) => ExecOkAt[name] = DateTime.UtcNow;
         public static void MarkExecBad(string name) => ExecBadAt[name] = DateTime.UtcNow;
@@ -387,9 +387,9 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> LastSeenDiag = new();
 
         // (linux, uptimeMinutes, osEverReportedToHost, darkSince — zero if heartbeat currently Ok)
-        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (bool linux, double upMin, bool reported, TimeSpan dark)> LastRaw = new();
-        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> LastSeenDark = new();
-        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> DarkSince = new();
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (bool linux, double upMin, bool reported, TimeSpan dark)> LastRaw = new();
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> LastSeenDark = new();
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> DarkSince = new();
     }
 
     /// <summary>
@@ -400,7 +400,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     internal sealed class ReadinessProber(SandboxEngine engine, JobStore jobs,
         ILogger<ReadinessProber> log) : BackgroundService
     {
-        static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> KeepAliveAt = new();
+        internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> KeepAliveAt = new();
         const string Probe =
             "if (Test-Path C:\\Sandbox\\ready.txt) { Get-Content C:\\Sandbox\\ready.txt } " +
             "else { 'NOT-YET' }";
@@ -493,7 +493,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     /// Desktop-readiness markers observed (vm -> ready.txt content). Sticky
     /// per VM lifetime: once the desktop logged on, it stays usable.
     /// </summary>
-    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ReadyCache = new();
+    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ReadyCache = new();
 
     /// <summary>
     /// Block until the guest DESKTOP is actually up: polls the FirstLogonCommands

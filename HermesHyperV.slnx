@@ -1,2 +1,4 @@
 <Solution>
+  <Project Path="src/HermesHyperV/HermesHyperV.csproj" />
+  <Project Path="tests/HermesHyperV.Tests/HermesHyperV.Tests.csproj" />
 </Solution>

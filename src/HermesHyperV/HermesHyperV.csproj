@@ -18,4 +18,8 @@
     <EmbeddedResource Include="ps1\*.ps1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="HermesHyperV.Tests" />
+  </ItemGroup>
+
 </Project>

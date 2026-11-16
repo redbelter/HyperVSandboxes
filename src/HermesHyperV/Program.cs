@@ -22,6 +22,10 @@ if (WindowsServiceHelpers.IsWindowsService())
 var root = Environment.GetEnvironmentVariable("HYPERV_ROOT") ?? @"C:\HyperV";
 builder.Services.AddSingleton(new SandboxSettings(Root: root));
 builder.Services.AddSingleton<PowerShellRunner>();
+if (Environment.GetEnvironmentVariable("HYPERV_FAKE_PS") == "1")
+    builder.Services.AddSingleton<IPowerShellRunner>(new FakeRunner());   // CI: no Hyper-V needed
+else
+    builder.Services.AddSingleton<IPowerShellRunner>(sp => sp.GetRequiredService<PowerShellRunner>());
 builder.Services.AddSingleton<SandboxEngine>();
 builder.Services.AddSingleton<JobStore>();
 builder.Services.AddSingleton<VmsCache>();

@@ -14,7 +14,12 @@ namespace HermesHyperV.Engine;
 /// env HV_REQ (base64 utf8), executes, and prints one compact JSON object to
 /// stdout: { "ok": bool, "data": [...], "error": null|string }.
 /// </summary>
-public sealed class PowerShellRunner(ILogger<PowerShellRunner> log)
+public interface IPowerShellRunner
+{
+    Task<PsResult> RunScriptAsync(string resourceName, object? request, int timeoutSeconds, CancellationToken ct = default);
+}
+
+public sealed class PowerShellRunner(ILogger<PowerShellRunner> log) : IPowerShellRunner
 {
     static PowerShellRunner()
     {
