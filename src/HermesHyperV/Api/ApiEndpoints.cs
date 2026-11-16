@@ -34,7 +34,8 @@ public static class Api
             }
             catch
             {
-                return Results.Json(new { ok = true, data = new { vms = Array.Empty<object>() } });
+                // empty list with ok:false — dashboard keeps its last render
+                return Results.Json(new { ok = false, error = "vm list failed", data = new { vms = Array.Empty<object>() } });
             }
         });
 
@@ -78,9 +79,11 @@ public static class Api
             return Results.Json(new { job = jobs.Spawn("start_vm", async ct => await e.StartVmAsync(body.Name!, ct)) });
         });
 
-        api.MapPost("/run", (RunReq body, SandboxEngine e, JobStore jobs) =>
+        api.MapPost("/run", (RunReqBoth body, SandboxEngine e, JobStore jobs) =>
         {
-            var cmd = string.IsNullOrWhiteSpace(body.Cmd) ? "whoami" : body.Cmd!;
+            var cmd = !string.IsNullOrWhiteSpace(body.Cmd) ? body.Cmd
+                    : !string.IsNullOrWhiteSpace(body.Command) ? body.Command
+                    : "whoami";
             jobs.Blog($"run_ps(\"{body.Name}\", \"{(cmd.Length > 70 ? cmd[..70] : cmd)}\")", "tool");
             var jid = jobs.Spawn("run_ps", async ct =>
                 await e.RunPsAsync(body.Name!, cmd, body.TimeoutS ?? 60, ct: ct));
@@ -105,7 +108,10 @@ public static class Api
         });
 
         api.MapPost("/release", (NameReq body, SandboxEngine e) =>
-            Results.Json(new { ok = true, data = SandboxEngine.ReleaseVm(body.Name ?? "") }));
+        {
+            try { return Results.Json(new { ok = true, data = SandboxEngine.ReleaseVm(body.Name ?? "") }); }
+            catch (Exception ex) { return Results.Json(new { ok = false, error = ex.Message }); }
+        });
 
         api.MapGet("/checkouts", () => Results.Json(new { ok = true, data = SandboxEngine.ListCheckouts() }));
 
@@ -169,6 +175,13 @@ public static class Api
     public sealed record RunReq([property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
                                 [property: System.Text.Json.Serialization.JsonPropertyName("cmd")] string? Cmd,
                                 [property: System.Text.Json.Serialization.JsonPropertyName("timeout_s")] int? TimeoutS);
+
+    /// <summary>Agents send either field spelling; accept both.</summary>
+    public sealed record RunReqBoth(
+        [property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
+        [property: System.Text.Json.Serialization.JsonPropertyName("cmd")] string? Cmd,
+        [property: System.Text.Json.Serialization.JsonPropertyName("command")] string? Command,
+        [property: System.Text.Json.Serialization.JsonPropertyName("timeout_s")] int? TimeoutS);
     public sealed record CreateReq([property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
                                    [property: System.Text.Json.Serialization.JsonPropertyName("iso")] string? Iso,
                                    [property: System.Text.Json.Serialization.JsonPropertyName("memory_mb")] int? MemoryMb,

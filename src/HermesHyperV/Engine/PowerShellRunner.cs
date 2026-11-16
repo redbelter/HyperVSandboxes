@@ -63,6 +63,7 @@ public sealed class PowerShellRunner(ILogger<PowerShellRunner> log) : IPowerShel
         catch (OperationCanceledException)
         {
             try { proc.Kill(entireProcessTree: true); } catch { }
+            if (tmpFile is not null) { try { File.Delete(tmpFile); } catch { } }
             return new PsResult(false, null, $"powershell timed out after {timeoutSeconds}s");
         }
 

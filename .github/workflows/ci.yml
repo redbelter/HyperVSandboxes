@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mocked tier: HYPERV_FAKE_PS=1 swaps in the in-process FakeRunner, so the
+      # full REST/MCP/engine surface is exercised without Hyper-V being present.
+      - name: xunit suite (fake PowerShell runner)
+        env:
+          HYPERV_FAKE_PS: "1"
+        run: dotnet test tests/HermesHyperV.Tests -c Release --nologo -v q
+
+      - name: dashboard JS syntax gate
+        run: |
+          node -e "const fs=require('fs');const h=fs.readFileSync('src/HermesHyperV/wwwroot/dashboard.html','utf8');const m=h.match(/<script>([\s\S]*)<\/script>/);fs.writeFileSync('dash.js',m[1]);"
+          node --check dash.js
+
+  smoke:
+    # Live tier: boots the service on the runner and runs tests/smoke.py against it.
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: publish
+        run: dotnet publish src/HermesHyperV -c Release -r win-x64 --nologo -v q
+      - name: run service + smoke suite
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem -Recurse -Filter HermesHyperV.exe src/HermesHyperV/bin/Release | Select-Object -First 1).FullName
+          Start-Process -FilePath $exe -ArgumentList '--console' -WindowStyle Hidden
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            try { Invoke-RestMethod http://127.0.0.1:5003/api/status | Out-Null; $ok = $true; break } catch {}
+          }
+          if (-not $ok) { Write-Error 'service never came up'; exit 1 }
+          python tests/smoke.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

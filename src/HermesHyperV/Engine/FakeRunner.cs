@@ -43,7 +43,7 @@ public sealed class FakeRunner : IPowerShellRunner
                      "ips":["192.168.50.31"],"os_reported":"Server 2025"}
                     """),
                 "diag" => Parse("""
-                    {"events":[{"id":256,"t":"10:00:00","lvl":"Informational","m":"VM configured"}]}
+                    {"events":[{"id":256,"t":"2026-01-01T10:00:00","log":"Worker-Admin","level":"Informational","msg":"VM configured"}]}
                     """),
                 "editions" => Parse("""
                     {"index":1,"name":"Windows Server 2025 Datacenter Evaluation (Desktop Experience)"}

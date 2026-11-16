@@ -11,12 +11,13 @@ try {
   $sec = ConvertTo-SecureString ([string]$req.password) -AsPlainText -Force
   $cred = New-Object System.Management.Automation.PSCredential([string]$req.user, $sec)
   $job = Invoke-Command -VMName ([string]$req.vm) -Credential $cred -ScriptBlock $sb -AsJob
-  if (Wait-Job $job -Timeout ([int]$req.timeout)) {
+  $t = [int]$req.timeout; if ($t -le 0) { $t = 60 }   # omitted timeout must not mean 'instant'
+  if (Wait-Job $job -Timeout $t) {
     $r = Receive-Job $job
     emit @{ output = ($r | Out-String); timed_out = $false }
   } else {
     Stop-Job $job -ErrorAction SilentlyContinue
-    $r = Receive-Job $job -ErrorAction SilentlyContinue
+    $r = Receive-Job $job -Keep -ErrorAction SilentlyContinue
     emit @{ output = ($r | Out-String); timed_out = $true }
   }
   Remove-Job $job -Force -ErrorAction SilentlyContinue

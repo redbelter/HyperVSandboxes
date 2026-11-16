@@ -66,6 +66,13 @@ public sealed class JobStore(ILogger<JobStore> log)
             j["status"] = status;
             j["result"] = result is null ? null : ToNode(result);
             if (error is not null) j["error"] = error;
+            // keep the newest 200 finished rows; running ones always survive
+            var done = _jobs.Where(kv => (string?)kv.Value["status"] != "running").Count();
+            if (done > 200)
+                foreach (var kv in _jobs.Where(kv => (string?)kv.Value["status"] != "running")
+                                        .OrderBy(kv => (long?)kv.Value["started"] ?? 0)
+                                        .Take(done - 200).ToList())
+                    _jobs.Remove(kv.Key);
         }
     }
 

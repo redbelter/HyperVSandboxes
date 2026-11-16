@@ -81,7 +81,7 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
         throw new FileNotFoundException($"ISO '{iso}' not found in {MediaDir} and not in catalog");
     }
 
-    string RenderOobe(string vmName, string password, string ip)
+    (string OobePath, string ProvPath) RenderOobe(string vmName, string password, string ip)
     {
         Directory.CreateDirectory(MediaDir);
         var computer = new string((VmRef(vmName)).Where(c => char.IsAsciiLetterOrDigit(c) || c == '-').ToArray());
@@ -106,13 +106,8 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
             .Replace("__PROV__", IsoCatalog.ProvUrl);
         var firstPath = Path.Combine(MediaDir, $"{vmName}-prov_first.ps1");
         File.WriteAllText(firstPath, tmpl, new UTF8Encoding(false));
-        ProvScriptPath = firstPath;
-        return outPath;
+        return (outPath, firstPath);
     }
-
-    /// <summary>prov_first.ps1 rendered by the latest RenderOobe call; consumed
-    /// by CreateVmAsync when it invokes child_disk (same thread, no races).</summary>
-    string? ProvScriptPath { get; set; }
 
     // ------------------------------------------------------------------ tools
 
@@ -457,7 +452,7 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
                     }
                 }
                 catch (OperationCanceledException) { break; }
-                catch (Exception ex) { log.LogDebug(ex, "readiness probe cycle failed"); }
+                catch (Exception ex) { log.LogWarning(ex, "readiness probe cycle failed"); }
                 try { await Task.Delay(8000, ct); } catch { break; }
             }
         }
@@ -598,7 +593,7 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
         password ??= GuestDefaults.Password;
 
         var ip = ClaimIp(vmName);
-        var oobe = RenderOobe(vmName, password, ip);
+        var (oobe, prov) = RenderOobe(vmName, password, ip);
         var vroot = Path.Combine(VmDir, vmName);
 
         var golden = GoldenPath(path, edition, diskGb);
@@ -630,8 +625,8 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
             log.LogInformation("spawning {Vm} from golden ({Golden})", vmName, Path.GetFileName(golden));
             var child = await ps.RunScriptAsync("child_disk", new
             {
-                golden, root = vroot, unattend = oobe, prov = ProvScriptPath,
-            }, 300, ct);
+                golden, root = vroot, unattend = oobe, prov,
+            }, 600, ct);
             if (!child.Ok) throw new InvalidOperationException($"child disk creation failed: {child.Error}");
 
             var create = await ps.RunScriptAsync("vm_lifecycle", new
@@ -676,11 +671,22 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
     /// (unattend/meta.json) — two guests, one address. Scan what's actually
     /// claimed on disk (meta.json per Linux VM, *-oobe.xml per Windows VM) and
     /// take the first hole above .10.</summary>
-    string ClaimIp(string vmName) => LinuxIpPool.GetOrAdd(vmName, _ => PickFreeIp());
+    static readonly object IpGate = new();
 
-    string PickFreeIp()
+    string ClaimIp(string vmName)
+    {
+        if (LinuxIpPool.TryGetValue(vmName, out var known)) return known;
+        lock (IpGate)   // GetOrAdd's factory can run twice concurrently; lock makes hole-picking atomic
+            return LinuxIpPool.GetOrAdd(vmName, _ => PickFreeIpLocked());
+    }
+
+    string PickFreeIpLocked()
     {
         var taken = new HashSet<int>();
+        foreach (var v in LinuxIpPool.Values)
+            if (v is { Length: > 0 } s && s.StartsWith("192.168.50.") &&
+                int.TryParse(s[(s.LastIndexOf('.') + 1)..], out var vo) && vo >= 1 && vo <= 254)
+                taken.Add(vo);
         foreach (var f in Safely(Directory.EnumerateFiles, VmDir, "meta.json", SearchOption.AllDirectories)
                       .Concat(Safely(Directory.EnumerateFiles, MediaDir, "*-oobe.xml"))
                       .Concat(Safely(Directory.EnumerateFiles, MediaDir, "*-prov_first.ps1")))
@@ -915,6 +921,7 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
         LinuxIpPool.TryRemove(full, out _);
         Watch.Forget(full);
         CheckoutStore.Forget(full);
+        ReadinessProber.KeepAliveAt.TryRemove(full, out _);
         return r;
     }
 
@@ -924,7 +931,8 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
         var r = await Run1("vm_lifecycle", new { action = "purge", tag = cfg.Tag, vmroot = VmDir, media = MediaDir, keep }, 600, ct);
         ReadyCache.Clear();
         LinuxIpPool.Clear();
-        Watch.ClearAll();   // leases survive purge on purpose (registry is host-wide)
+        Watch.ClearAll();
+        ReadinessProber.KeepAliveAt.Clear();   // leases survive purge on purpose (registry is host-wide)
         return r;
     }
 

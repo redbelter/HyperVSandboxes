@@ -195,7 +195,7 @@ function renderVMs(data){
   if(selName && !vmCache.some(v=>v.name===selName)) { selName=null; selMode=null; }
   syncConsole();
 }
-function pollVMs(){ jget('/api/vms').then(d=>{ if(d.ok) renderVMs(d.data); }).catch(function(){}); }
+function pollVMs(){ jget('/api/vms').then(d=>{ if(d.ok!==false) renderVMs(d.data); }).catch(function(){}); }
 function pollJobs(){
   jget('/api/jobs').then(d=>{
     d.jobs.forEach(function(j){
@@ -203,7 +203,7 @@ function pollJobs(){
         jobs[j.id]=true;
         if(j.name==='run_ps'){
           var c=document.getElementById('con');
-          if(j.status==='error'){ c.innerHTML += '\n<span class="err">[error] '+esc(j.error||'failed')+'</span>'; }
+          if(j.status==='error'){ c.innerHTML += '\n<span class="err">[error] '+esc(j.error||'failed')+'</span>'; renderVMsSafe(); }
           else if(j.result){
             var r=j.result;
             if(r.output) c.innerHTML += '\n'+esc(r.output.replace(/\n+$/,''));

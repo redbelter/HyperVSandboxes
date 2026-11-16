@@ -28,12 +28,14 @@ try {
       $hp = (Get-CimInstance Win32_ComputerSystem).HypervisorPresent
       $media = [string]$req.media
       $isos = @(Get-ChildItem $media -Filter '*.iso' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
-      $du = Get-PSDrive ($media.Substring(0,1)) -ErrorAction SilentlyContinue
+      $drv = try { (Split-Path -Qualifier $media) -replace ':','' } catch { 'C' }
+      if (-not $drv) { $drv = 'C' }
+      $du = Get-PSDrive $drv -ErrorAction SilentlyContinue
       emit @{
         root=[string]$req.root; hypervisor_present=$hp
         vmms_service=$(if ($svc) { $svc.Status.ToString().ToLower() } else { 'not-installed' })
         isos=$isos
-        disks=@{ ($media.Substring(0,1) + ':') = @{ total_gb=[math]::Round(($du.Free+$du.Used)/1GB,1); free_gb=[math]::Round($du.Free/1GB,1) } }
+        disks=@{ ($drv + ':') = @{ total_gb=[math]::Round(($du.Free+$du.Used)/1GB,1); free_gb=[math]::Round($du.Free/1GB,1) } }
       }
     }
 
@@ -229,7 +231,12 @@ try {
       $name=[string]$req.name; $tag=[string]$req.tag; $root=[string]$req.root
       $oobe=[string]$req.oobe
       $vm = Get-VM -Name $name -ErrorAction SilentlyContinue
-      if (-not $vm) { emit @{ deleted=$false; reason='not-found' } }
+      if (-not $vm) {
+        # VM config gone but leftovers can remain — sweep the folder anyway
+        if (Test-Path $root) { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($oobe -and (Test-Path $oobe)) { Remove-Item $oobe -Force -ErrorAction SilentlyContinue }
+        emit @{ deleted=$true; reason='folder-only'; folder=$root }
+      }
       elseif ($vm.Notes -ne $tag) { throw "refusing: $name is not a sandbox VM (wrong tag)" }
       else {
         if ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
@@ -320,7 +327,7 @@ try {
     }
 
     'wait' {
-      $name=[string]$req.name; $want=[string]$req.want; $timeout=[int]$req.timeout_s
+      $name=[string]$req.name; $want=[string]$req.want; $timeout=[int]$req.timeout_s; if ($timeout -le 0) { $timeout = 300 }
       $deadline=(Get-Date).AddSeconds($timeout)
       $state=''
       while ((Get-Date) -lt $deadline) {
@@ -345,7 +352,7 @@ try {
       foreach ($log in 'Microsoft-Windows-Hyper-V-Worker-Admin','Microsoft-Windows-Hyper-V-VMMS-Admin','Microsoft-Windows-Hyper-V-VmSwitch-Admin') {
         $events += @(Get-WinEvent -FilterHashtable @{LogName=$log; StartTime=$cut} -MaxEvents 4000 -ErrorAction SilentlyContinue |
           Where-Object { $_.Message -match $pat } |
-          ForEach-Object { @{ t=$_.TimeCreated.ToString('s'); log=$_.LogName.Split('.')[-2]; id=$_.Id; level=$_.LevelDisplayName;
+          ForEach-Object { @{ t=$_.TimeCreated.ToString('s'); log=($_.LogName -split 'Hyper-V-')[-1]; id=$_.Id; level=$_.LevelDisplayName;
                               msg=(($_.Message -replace "[\r\n]+",' ') -replace '\s+',' ') } })
       }
       emit @{ name=$name; guid=$guid; events=($events | Sort-Object t | Select-Object -Last 30) }
