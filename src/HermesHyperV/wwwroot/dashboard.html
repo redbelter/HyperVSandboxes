@@ -52,6 +52,8 @@
   .kv b { font-weight:600; } .kv span.ok { color:var(--ok); } .kv span.err { color:var(--err); } .kv span.warn { color:var(--warn); }
   .banner { border:1px solid var(--warn); color:var(--warn); border-radius:10px; padding:8px 12px; margin-bottom:14px; display:none; }
   .creds { font-family:ui-monospace,Consolas,monospace; font-size:11px; color:var(--dim); }
+  .lease { font-size:11px; color:var(--dim); margin:-2px 0 4px; }
+  .lease b { color:var(--accent); }
   .creds b { color:var(--fg); cursor:pointer; }
   .creds b:hover { color:var(--accent); }
   .con .err { color:var(--err); } .con .dim { color:var(--dim); } .con .pmt { color:var(--ok); }
@@ -175,8 +177,14 @@ function renderVMs(data){
     var creds = v.guest_user ? ('<div class="creds">login <b title="click to copy user:password" onclick="cpw('+ci+')">'+esc(v.guest_user)+(v.guest_password?' / '+esc(v.guest_password):'')+'</b>'+
                   (lin&&ip?' · ssh '+esc(v.guest_user)+'@'+esc(ip):'')+'</div>') : '';
     var stuck = v.stuck ? '<div class="stucknote">'+esc(v.stuck)+'</div>' : '';
+    var lease = '';
+    if(v.checkout){
+      var m = Math.max(0, Math.round((v.checkout.remaining_s||0)/60));
+      lease = '<div class="lease">held by <b>'+esc(v.checkout.who)+'</b> · '+m+'m left'+
+              (v.checkout.reason?' · '+esc(v.checkout.reason):'')+'</div>';
+    }
     return '<div class="vm'+(v.name===selName?' sel':'')+'" onclick="selectVM(\''+esc(v.name)+'\')"><div class="hd"><b>'+esc(v.name)+(lin?' <span class="chip">debian</span>':'')+'</b><span class="chip '+v.phase+'">'+esc(chipTxt)+'</span></div>'+
-      '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(ip?esc(ip):(v.state==='Running'?'no IP yet (installing / network idle)':'—'))+'</div>'+stuck+creds+
+      '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(ip?esc(ip):(v.state==='Running'?'no IP yet (installing / network idle)':'—'))+'</div>'+lease+stuck+creds+
       '<div class="acts"><button '+(ready?'':'disabled ')+'onclick="event.stopPropagation();pick(\''+esc(v.name)+'\','+(lin?'true':'false')+')">'+(lin?'command':'powershell')+'</button>'+
       (lin?'<button '+(ready?'':'disabled ')+'onclick="event.stopPropagation();termGo(\''+esc(v.name)+'\')">terminal</button>':'')+
       (!ready&&v.state==='Running'&&!lin?'<button onclick="event.stopPropagation();diag(\''+esc(v.name)+'\')">diagnose</button>':'')+

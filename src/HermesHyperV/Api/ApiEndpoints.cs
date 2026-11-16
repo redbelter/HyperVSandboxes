@@ -57,7 +57,7 @@ public static class Api
         api.MapPost("/delete", (NameReq body, SandboxEngine e, JobStore jobs) =>
         {
             jobs.Blog($"delete_vm(name=\"{body.Name}\") — VM + vhdx + folder", "tool");
-            return Results.Json(new { job = jobs.Spawn("delete_vm", async ct => await e.DeleteVmAsync(body.Name!, ct)) });
+            return Results.Json(new { job = jobs.Spawn("delete_vm", async ct => await e.DeleteVmAsync(body.Name!, force: true, ct: ct)) });
         });
 
         api.MapPost("/purge", (SandboxEngine e, JobStore jobs) =>
@@ -88,6 +88,26 @@ public static class Api
         });
 
         api.MapGet("/jobs", (JobStore jobs) => Results.Json(new { jobs = jobs.Jobs() }));
+
+        api.MapPost("/checkout", (CheckoutReq body, SandboxEngine e) =>
+        {
+            // Claim a sandbox name for a person/agent with a TTL. Works before
+            // the VM exists — the name is the key. Activity extends the lease.
+            if (string.IsNullOrWhiteSpace(body.Name))
+                return Results.Json(new { ok = false, error = "name required" });
+            try
+            {
+                var data = SandboxEngine.CheckoutVm(body.Name!, body.Who ?? "anonymous",
+                                                    body.Reason, body.TtlMin ?? 120);
+                return Results.Json(new { ok = true, data });
+            }
+            catch (Exception ex) { return Results.Json(new { ok = false, error = ex.Message }); }
+        });
+
+        api.MapPost("/release", (NameReq body, SandboxEngine e) =>
+            Results.Json(new { ok = true, data = SandboxEngine.ReleaseVm(body.Name ?? "") }));
+
+        api.MapGet("/checkouts", () => Results.Json(new { ok = true, data = SandboxEngine.ListCheckouts() }));
 
         api.MapGet("/catalog", () => Results.Json(new
         {
@@ -142,6 +162,10 @@ public static class Api
     }
 
     public sealed record NameReq(string? Name);
+    public sealed record CheckoutReq([property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
+                                     [property: System.Text.Json.Serialization.JsonPropertyName("who")] string? Who,
+                                     string? Reason,
+                                     [property: System.Text.Json.Serialization.JsonPropertyName("ttl_min")] int? TtlMin);
     public sealed record RunReq([property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
                                 [property: System.Text.Json.Serialization.JsonPropertyName("cmd")] string? Cmd,
                                 [property: System.Text.Json.Serialization.JsonPropertyName("timeout_s")] int? TimeoutS);

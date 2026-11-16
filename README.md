@@ -131,6 +131,21 @@ This is a convenience door for disposable sandboxes, not a security boundary.
 Tighten it (host allowlist, drop plain-HTTP forwarding) if your threat model
 needs that.
 
+## Leases (checkout / expiry / purpose)
+
+A shared host runs several agents against one fleet, so every sandbox can be
+claimed: `checkout_vm(name, who, reason, ttl_min)` records holder + purpose +
+expiry (`C:\HyperV\checkouts.json`, survives service restarts). The lease
+shows up on every `/api/vms` row (`checkout: {who, reason, expires_at,
+remaining_s}`), in `/api/checkouts`, on dashboard cards ("held by X · Nm
+left · why"), and via MCP `list_checkouts`. Guest activity (any `run_ps`, any
+terminal connect) extends the lease automatically — a working holder never
+loses the box mid-task. Protected: `delete_vm` skips leased VMs with the
+holder + expiry in its reply (pass `force=true` to override), and `purge_all`
+keeps leased VMs instead of nuking them. Default TTL 120 min, clamped to
+5–1440. `release_vm` gives it up early. Claim the name right after
+`create_vm`; release when done.
+
 ## Dashboard
 
 - VM cards (state, phase, IP, uptime, guest login/password click-to-copy);

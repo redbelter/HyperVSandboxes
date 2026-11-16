@@ -73,6 +73,16 @@ internal static class IsoCatalog
             "Debian 13", "debian-13-generic-amd64.raw", "sandbox"),
     };
 
+    /// <summary>Host payload door for the pilot bootstrap (PilotServe).</summary>
+    public static string ProvUrl
+    {
+        get
+        {
+            var pport = int.TryParse(Environment.GetEnvironmentVariable("HYPERV_PILOT_PORT"), out var pp) ? pp : PilotServe.Port;
+            return $"http://192.168.50.1:{pport}";
+        }
+    }
+
     public static bool IsLinux(string key) =>
         Entries.TryGetValue(key, out var e) && e.Raw.Length > 0;
 }
@@ -133,10 +143,43 @@ internal static class Oobe
                     <CommandLine>cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name fDenyTSConnections -Value 0 -Force; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue; Enable-PSRemoting -Force -SkipNetworkProfileCheck; Set-Service WinRM -StartupType Automatic; New-Item -ItemType Directory -Force -Path C:\\Sandbox | Out-Null; Set-Content -Path C:\\Sandbox\\ready.txt -Value ('ready ' + (Get-Date -Format 'o'))"</CommandLine>
                     <Description>EnableRDP+PSRemoting</Description>
                 </SynchronousCommand>
+                <SynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <!-- Short by design: SMI rejects over-long CommandLine
+                         values (0x80220005 aborts the whole pass). The real
+                         bootstrap lives in prov_first.ps1, baked into the
+                         child disk by child_disk.ps1. -->
+                    <CommandLine>cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\prov_first.ps1</CommandLine>
+                    <Description>SandboxLAN IP + pilot bootstrap</Description>
+                </SynchronousCommand>
             </FirstLogonCommands>
         </component>
     </settings>
 </unattend>
+
+""";
+
+    // First-logon bootstrap baked to C:\prov_first.ps1 by child_disk. Plain
+    // raw string (SMI-safe: the unattend only references it by path).
+    // Placeholders: __IP__ = claimed SandboxLAN address, __PROV__ = host
+    // payload-server base URL (PilotServe). Sets the static IP (internal
+    // switch has no DHCP), opens the pilot port, registers the ProvOnce
+    // retry task which pulls prov_local.ps1 -> installs WindowsPilot.
+    public const string ProvFirst = """
+$ErrorActionPreference = 'SilentlyContinue'
+$a = (Get-NetAdapter | Where-Object Status -eq Up | Select-Object -First 1).Name
+if ($a -and -not (Get-NetIPAddress -InterfaceAlias $a -AddressFamily IPv4 | Where-Object { $_.IPAddress -like '192.168.50.*' })) {
+  New-NetIPAddress -InterfaceAlias $a -IPAddress __IP__ -PrefixLength 24 | Out-Null
+  New-NetRoute -InterfaceAlias $a -DestinationPrefix '0.0.0.0/0' -NextHop 192.168.50.1 | Out-Null
+}
+netsh.exe advfirewall firewall add rule name=WindowsPilot dir=in action=allow protocol=TCP localport=8791 profile=any | Out-Null
+Set-Content -Path C:\prov_run.ps1 -Encoding ASCII -Value 'if (-not (Test-Path C:\prov_local.ps1)) { try { Invoke-WebRequest __PROV__/prov_local.ps1 -OutFile C:\prov_local.ps1 -UseBasicParsing } catch { exit 1 } }; . C:\prov_local.ps1'
+if (-not (Get-ScheduledTask ProvOnce -ErrorAction SilentlyContinue)) {
+  $act = New-ScheduledTaskAction -Execute powershell.exe -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\prov_run.ps1'
+  $trg = @(New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration (New-TimeSpan -Days 999))
+  Register-ScheduledTask -TaskName ProvOnce -Action $act -Trigger $trg -User SYSTEM -RunLevel Highest -Force | Out-Null
+}
+Start-ScheduledTask -TaskName ProvOnce
 
 """;
 }

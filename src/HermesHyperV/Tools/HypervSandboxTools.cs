@@ -46,6 +46,22 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
     public Task<JsonElement> Vm_health(string name, CancellationToken ct) =>
         engine.VmHealthAsync(name, ct);
 
+    [McpServerTool, Description("Claim a sandbox name: who holds it, why, until expiry (default 120 min, "
+        + "5-1440). Activity (run_ps / terminal) extends it automatically; another agent's checkout "
+        + "survives service restarts. Call right after create_vm so everyone can see who owns what.")]
+    public JsonElement Checkout_vm(string name, CancellationToken ct,
+        [Description("person or agent claiming it")] string who = "anonymous",
+        [Description("short purpose, e.g. 'testing nginx reverse proxy'")] string? reason = null,
+        [Description("lease minutes, default 120")] int ttl_min = 120)
+        => SandboxEngine.CheckoutVm(name, who, reason, ttl_min);
+
+    [McpServerTool, Description("Give up a sandbox lease early (delete it yourself afterwards if you want it gone).")]
+    public JsonElement Release_vm(string name, CancellationToken ct) => SandboxEngine.ReleaseVm(name);
+
+    [McpServerTool, Description("Current sandbox leases: holder, purpose, remaining time. Check this before "
+        + "deleting/purging VMs you did not create — purge_all keeps leased VMs automatically.")]
+    public JsonElement List_checkouts(CancellationToken ct) => SandboxEngine.ListCheckouts();
+
     [McpServerTool, Description("List Windows editions inside an ISO (catalog name, file in C:\\HyperV\\Media, or absolute path).")]
     public Task<JsonElement> List_editions(string iso, CancellationToken ct) =>
         engine.ListEditionsAsync(iso, ct);
@@ -91,7 +107,9 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
     public Task<JsonElement> Stop_vm(string name, CancellationToken ct) => engine.StopVmAsync(name, ct);
 
     [McpServerTool, Description("Destroy a sandbox VM and its VHDX/folder. Refuses VMs not tagged as sandboxes.")]
-    public Task<JsonElement> Delete_vm(string name, CancellationToken ct) => engine.DeleteVmAsync(name, ct);
+    public Task<JsonElement> Delete_vm(string name, CancellationToken ct,
+        [Description("true = delete even while another agent holds a lease on it")] bool force = false)
+        => engine.DeleteVmAsync(name, force, ct);
 
     [McpServerTool, Description("Destroy ALL tagged sandbox VMs and their files (nukes this host's fleet).")]
     public Task<JsonElement> Purge_all(CancellationToken ct) => engine.PurgeAsync(ct);

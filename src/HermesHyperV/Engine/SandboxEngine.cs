@@ -81,7 +81,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         throw new FileNotFoundException($"ISO '{iso}' not found in {MediaDir} and not in catalog");
     }
 
-    string RenderOobe(string vmName, string password)
+    string RenderOobe(string vmName, string password, string ip)
     {
         Directory.CreateDirectory(MediaDir);
         var computer = new string((VmRef(vmName)).Where(c => char.IsAsciiLetterOrDigit(c) || c == '-').ToArray());
@@ -89,12 +89,30 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         if (computer.Length == 0) computer = "SANDBOX";
         var doc = Oobe.Template
             .Replace("__COMPUTERNAME__", computer.ToUpperInvariant())
-            .Replace("__PASSWORD__", System.Net.WebUtility.HtmlEncode(password));
+            .Replace("__PASSWORD__", System.Net.WebUtility.HtmlEncode(password))
+            .Replace("__IP__", ip);
         // HtmlEncode covers & < > which is what we need for XML text nodes
         var outPath = Path.Combine(MediaDir, $"{vmName}-oobe.xml");
         File.WriteAllText(outPath, doc, new UTF8Encoding(false));
+
+        // First-logon bootstrap body (the unattend keeps a SHORT CommandLine —
+        // SMI rejects over-long values with 0x80220005). child_disk bakes this
+        // file to C:\prov_first.ps1 while the child VHDX is mounted. It sets
+        // the static SandboxLAN IP (internal switch, no DHCP), allows pilot's
+        // port through the guest firewall, then registers the self-healing
+        // ProvOnce task which pulls prov_local.ps1 from PilotServe.
+        var tmpl = Oobe.ProvFirst
+            .Replace("__IP__", ip)
+            .Replace("__PROV__", IsoCatalog.ProvUrl);
+        var firstPath = Path.Combine(MediaDir, $"{vmName}-prov_first.ps1");
+        File.WriteAllText(firstPath, tmpl, new UTF8Encoding(false));
+        ProvScriptPath = firstPath;
         return outPath;
     }
+
+    /// <summary>prov_first.ps1 rendered by the latest RenderOobe call; consumed
+    /// by CreateVmAsync when it invokes child_disk (same thread, no races).</summary>
+    string? ProvScriptPath { get; set; }
 
     // ------------------------------------------------------------------ tools
 
@@ -126,6 +144,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             o["phase"] = Phase(vm);
             var nm = vm.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
             o["stuck"] = StuckOf(nm);
+            o["checkout"] = CheckoutStore.Status(nm);
             var credFile = Path.Combine(VmDir, nm, "creds.json");
             if (nm.Length > 0 && File.Exists(credFile))
             {
@@ -165,6 +184,23 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         // desktop actually logged on (ready.txt seen by the readiness prober).
         return ReadyCache.ContainsKey(name) ? "Ready" : "Installing";
     }
+
+    public static JsonElement CheckoutVm(string name, string who, string? reason, int minutes)
+    {
+        var full = CheckName(name);
+        return JsonSerializer.SerializeToElement(CheckoutStore.Checkout(full, who, reason, minutes));
+    }
+
+    public static JsonElement ReleaseVm(string name)
+    {
+        var full = CheckName(name);
+        return JsonSerializer.SerializeToElement(new { released = full, had = CheckoutStore.Release(full) });
+    }
+
+    public static JsonElement ListCheckouts()
+        => JsonSerializer.SerializeToElement(CheckoutStore.ActiveNames()
+            .Select(nm => new { name = nm, @base = VmRef(nm), lease = CheckoutStore.Status(nm) })
+            .ToList());
 
     /// <summary>Full human sentence behind a 'Stuck' phase (null when healthy/inside budget).</summary>
     public static string? StuckOf(string name) => Watch.Verdict(name);
@@ -561,7 +597,8 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
         diskGb = Math.Clamp(diskGb, 40, 2040);
         password ??= GuestDefaults.Password;
 
-        var oobe = RenderOobe(vmName, password);
+        var ip = ClaimIp(vmName);
+        var oobe = RenderOobe(vmName, password, ip);
         var vroot = Path.Combine(VmDir, vmName);
 
         var golden = GoldenPath(path, edition, diskGb);
@@ -593,7 +630,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             log.LogInformation("spawning {Vm} from golden ({Golden})", vmName, Path.GetFileName(golden));
             var child = await ps.RunScriptAsync("child_disk", new
             {
-                golden, root = vroot, unattend = oobe,
+                golden, root = vroot, unattend = oobe, prov = ProvScriptPath,
             }, 300, ct);
             if (!child.Ok) throw new InvalidOperationException($"child disk creation failed: {child.Error}");
 
@@ -631,8 +668,55 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     /// </summary>
     static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> LinuxIpPool = new();
 
-    string ClaimIp(string vmName) => LinuxIpPool.GetOrAdd(vmName,
-        _ => "192.168.50." + (10 + LinuxIpPool.Count % 200));
+    static readonly Regex SubIpRe = new(@"192\.168\.50\.(\d{1,3})", RegexOptions.Compiled);
+
+    /// <summary>Pick a free SandboxLAN address WITHOUT trusting the in-memory
+    /// pool counter: after a service restart the counter restarts at 10 and
+    /// hands out IPs that older guests already baked into their disks
+    /// (unattend/meta.json) — two guests, one address. Scan what's actually
+    /// claimed on disk (meta.json per Linux VM, *-oobe.xml per Windows VM) and
+    /// take the first hole above .10.</summary>
+    string ClaimIp(string vmName) => LinuxIpPool.GetOrAdd(vmName, _ => PickFreeIp());
+
+    string PickFreeIp()
+    {
+        var taken = new HashSet<int>();
+        foreach (var f in Safely(Directory.EnumerateFiles, VmDir, "meta.json", SearchOption.AllDirectories)
+                      .Concat(Safely(Directory.EnumerateFiles, MediaDir, "*-oobe.xml"))
+                      .Concat(Safely(Directory.EnumerateFiles, MediaDir, "*-prov_first.ps1")))
+        {
+            // Media leftovers of deleted VMs must not reserve addresses forever:
+            // keep them only while the VM folder still exists (name = file leaf
+            // before the first '-'). VM dirs are checked directly — cheap.
+            if (!f.EndsWith("meta.json", StringComparison.OrdinalIgnoreCase))
+            {
+                // RenderOobe writes exactly "{vm}-oobe.xml" / "{vm}-prov_first.ps1"
+                // (vm names carry their own dashes — strip the suffix, don't split).
+                var leaf = Path.GetFileNameWithoutExtension(f)
+                    .Replace("-prov_first", "").Replace("-oobe", "");
+                if (!Directory.Exists(Path.Combine(VmDir, leaf))) continue;
+            }
+            try
+            {
+                foreach (Match m in SubIpRe.Matches(File.ReadAllText(f)))
+                    if (int.TryParse(m.Groups[1].Value, out var oct) && oct >= 1 && oct <= 254) taken.Add(oct);
+            }
+            catch { }
+        }
+        for (var i = 10; i < 250; i++)
+            if (!taken.Contains(i)) return "192.168.50." + i;
+        return "192.168.50." + (10 + taken.Count % 200);
+    }
+
+    static IEnumerable<string> Safely(Func<string, string, SearchOption, IEnumerable<string>> fn,
+                                      string dir, string glob, SearchOption opt = SearchOption.TopDirectoryOnly)
+    {
+        try { return fn(dir, glob, opt); } catch { return []; }
+    }
+    static IEnumerable<string> Safely(Func<string, string, IEnumerable<string>> fn, string dir, string glob)
+    {
+        try { return fn(dir, glob); } catch { return []; }
+    }
 
     /// <summary>IP from pool, falling back to the VM's meta.json (service
     /// restarts lose the pool; meta.json was written by linux_create).</summary>
@@ -663,6 +747,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     public async Task<(string ip, string key)> LinuxTermTargetAsync(string name, CancellationToken ct)
     {
         var full = CheckName(name);
+        CheckoutStore.Touch(full);   // opening the terminal = holder still working
         if (!IsLinuxVm(full))
             throw new InvalidOperationException(
                 $"{full} is not a Linux sandbox — Windows guests have no SSH listener; use run_ps");
@@ -810,9 +895,16 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
     public Task<JsonElement> StopVmAsync(string name, CancellationToken ct = default) =>
         Run1("vm_lifecycle", new { action = "power", name = CheckName(name), want = "stop" }, 300, ct);
 
-    public async Task<JsonElement> DeleteVmAsync(string name, CancellationToken ct = default)
+    public async Task<JsonElement> DeleteVmAsync(string name, bool force = false, CancellationToken ct = default)
     {
         var full = CheckName(name);
+        if (!force && CheckoutStore.Status(full) is { } le &&
+            le["who"]?.ToString() is { Length: > 0 } holder)
+            return JsonSerializer.SerializeToElement(new
+            {
+                deleted = false, skipped = full, holder,
+                hint = $"leased by {holder} until {le["expires_at"]} — pass force=true to override",
+            });
         var r = await Run1("vm_lifecycle", new
         {
             action = "delete", name = full, tag = cfg.Tag,
@@ -820,15 +912,19 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
             oobe = Path.Combine(MediaDir, $"{full}-oobe.xml"),
         }, 300, ct);
         ReadyCache.TryRemove(full, out _);
+        LinuxIpPool.TryRemove(full, out _);
         Watch.Forget(full);
+        CheckoutStore.Forget(full);
         return r;
     }
 
     public async Task<JsonElement> PurgeAsync(CancellationToken ct = default)
     {
-        var r = await Run1("vm_lifecycle", new { action = "purge", tag = cfg.Tag, vmroot = VmDir, media = MediaDir }, 600, ct);
+        var keep = CheckoutStore.ActiveNames();
+        var r = await Run1("vm_lifecycle", new { action = "purge", tag = cfg.Tag, vmroot = VmDir, media = MediaDir, keep }, 600, ct);
         ReadyCache.Clear();
-        Watch.ClearAll();
+        LinuxIpPool.Clear();
+        Watch.ClearAll();   // leases survive purge on purpose (registry is host-wide)
         return r;
     }
 
@@ -850,6 +946,7 @@ public sealed class SandboxEngine(PowerShellRunner ps, SandboxSettings cfg, ILog
                                               string? user = null, string? password = null, CancellationToken ct = default)
     {
         var full = CheckName(name);
+        CheckoutStore.Touch(full);   // guest activity = holder still working
         if (IsLinuxVm(full)) return await RunLinuxSshAsync(full, command, timeoutSec, ct);
         var cmdB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(command));
         PsResult r;

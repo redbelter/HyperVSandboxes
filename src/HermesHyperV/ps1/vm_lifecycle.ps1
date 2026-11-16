@@ -248,7 +248,8 @@ try {
 
     'purge' {
       $tag=[string]$req.tag; $vmroot=[string]$req.vmroot; $media=[string]$req.media
-      $names = @(Get-VM -ErrorAction SilentlyContinue | Where-Object { $_.Notes -eq $tag } | ForEach-Object { $_.VMName })
+      $keep = @($req.keep | ForEach-Object { [string]$_ })
+      $names = @(Get-VM -ErrorAction SilentlyContinue | Where-Object { $_.Notes -eq $tag } | Where-Object { $keep -notcontains $_.VMName } | ForEach-Object { $_.VMName })
       $deleted = @()
       foreach ($n in $names) {
         $vm = Get-VM -Name $n

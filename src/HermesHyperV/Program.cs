@@ -27,6 +27,7 @@ builder.Services.AddSingleton<JobStore>();
 builder.Services.AddSingleton<VmsCache>();
 builder.Services.AddHostedService<SandboxEngine.ReadinessProber>();
 builder.Services.AddHostedService<SandboxProxy>();   // guests' egress door (HTTP/CONNECT on :8899)
+builder.Services.AddHostedService<PilotServe>();     // pilot payload door (HTTP GET on :8898)
 
 // MCP server over streamable HTTP at /mcp (the agent-facing control plane)
 builder.Services.AddMcpServer().WithHttpTransport().WithTools<HypervSandboxTools>();

@@ -85,6 +85,14 @@ try {
     New-Item -ItemType Directory -Force -Path $panther | Out-Null
     Copy-Item $unattend (Join-Path $panther 'unattend.xml') -Force
     if (-not (Test-Path (Join-Path $panther 'unattend.xml'))) { throw 'panther copy missing' }
+    # first-logon bootstrap body (unattend's short CommandLine runs it from C:\)
+    if ($req.prov) {
+      $pv = [string]$req.prov
+      if (Test-Path $pv) {
+        Copy-Item $pv (Join-Path (Join-Path $seed 'os') 'prov_first.ps1') -Force
+        if (-not (Test-Path (Join-Path (Join-Path $seed 'os') 'prov_first.ps1'))) { throw 'prov_first copy missing' }
+      }
+    }
   }
   step 'dismount' {
     try {
