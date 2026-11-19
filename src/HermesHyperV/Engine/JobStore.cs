@@ -38,7 +38,10 @@ public sealed class JobStore(ILogger<JobStore> log)
     {
         var id = Guid.NewGuid().ToString("N")[..8];
         lock (_gate)
+        {
             _jobs[id] = new JsonObject { ["id"] = id, ["name"] = name, ["status"] = "running", ["started"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds() };
+            TrimFinished();
+        }
         Blog($"{name}(...) started", "tool");
 
         _ = Task.Run(async () =>
@@ -66,14 +69,19 @@ public sealed class JobStore(ILogger<JobStore> log)
             j["status"] = status;
             j["result"] = result is null ? null : ToNode(result);
             if (error is not null) j["error"] = error;
-            // keep the newest 200 finished rows; running ones always survive
-            var done = _jobs.Where(kv => (string?)kv.Value["status"] != "running").Count();
-            if (done > 200)
-                foreach (var kv in _jobs.Where(kv => (string?)kv.Value["status"] != "running")
-                                        .OrderBy(kv => (long?)kv.Value["started"] ?? 0)
-                                        .Take(done - 200).ToList())
-                    _jobs.Remove(kv.Key);
+            TrimFinished();
         }
+    }
+
+    /// <summary>Keep the newest 200 finished rows; running ones always survive.</summary>
+    void TrimFinished()
+    {
+        var done = _jobs.Count(kv => (string?)kv.Value["status"] != "running");
+        if (done <= 200) return;
+        foreach (var kv in _jobs.Where(kv => (string?)kv.Value["status"] != "running")
+                                .OrderBy(kv => (long?)kv.Value["started"] ?? 0)
+                                .Take(done - 200).ToList())
+            _jobs.Remove(kv.Key);
     }
 
     static JsonNode? ToNode(object o) => o switch

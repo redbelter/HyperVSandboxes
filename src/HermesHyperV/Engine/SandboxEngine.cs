@@ -193,9 +193,16 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
     }
 
     public static JsonElement ListCheckouts()
-        => JsonSerializer.SerializeToElement(CheckoutStore.ActiveNames()
-            .Select(nm => new { name = nm, @base = VmRef(nm), lease = CheckoutStore.Status(nm) })
+        => JsonSerializer.SerializeToElement(CheckoutStore.Snapshot()
+            .Select(kv => new { name = kv.Key, @base = VmRef(kv.Key), lease = kv.Value })
             .ToList());
+
+    public static JsonElement WithPhase(JsonElement vm)
+    {
+        var o = JsonSerializer.Deserialize<Dictionary<string, object?>>(vm.GetRawText())!;
+        o["phase"] = Phase(vm);
+        return JsonSerializer.SerializeToElement(o);
+    }
 
     /// <summary>Full human sentence behind a 'Stuck' phase (null when healthy/inside budget).</summary>
     public static string? StuckOf(string name) => Watch.Verdict(name);
@@ -222,7 +229,9 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
             heartbeat = vm.TryGetProperty("heartbeat", out var h) ? h.GetString() : null,
             phase = Phase(vm),
             diagnosis = Watch.Verdict(nm) ?? Watch.LastDiagnosis(nm),
-            os_reported = Watch.OsReported(nm),
+            // KVP report comes from the row itself; Watch caches it across polls
+            os_reported = (vm.TryGetProperty("os_reported", out var or) && !string.IsNullOrEmpty(or.GetString()))
+                          || Watch.OsReported(nm),
             uptime = vm.TryGetProperty("uptime", out var u) ? u.GetString() : null,
             linux = vm.TryGetProperty("linux", out var lz) && lz.GetBoolean(),
             recent_events = events,
@@ -280,9 +289,7 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
             var st = vm.TryGetProperty("state", out var s) ? s.GetString() : null;
             if (st != "Running") { LastRaw.TryRemove(name, out _); DarkSince.TryRemove(name, out _); return; }
             var linux = vm.TryGetProperty("linux", out var lz) && lz.GetBoolean();
-            double upMin = 0;
-            if (vm.TryGetProperty("uptime", out var u) &&
-                TimeSpan.TryParse(u.GetString(), out var up)) upMin = up.TotalMinutes;
+            double upMin = ParseUpMin(vm);
             var reported = vm.TryGetProperty("os_reported", out var or) &&
                            !string.IsNullOrEmpty(or.GetString());
             var darkOk = hb.StartsWith("Ok", StringComparison.OrdinalIgnoreCase);
@@ -332,12 +339,30 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
             }
         }
 
+        /// <summary>Hyper-V renders Uptime as "d hh:mm:ss" (space day-sep),
+        /// which invariant TimeSpan often refuses — normalize the space to a dot.</summary>
+        static double ParseUpMin(JsonElement vm)
+        {
+            if (!vm.TryGetProperty("uptime", out var u)) return 0;
+            var s = (u.GetString() ?? "").Trim();
+            if (s.Length == 0) return 0;
+            if (TimeSpan.TryParse(s, out var up)) return up.TotalMinutes;
+            if (TimeSpan.TryParse(s.Replace(' ', '.'), out var up2)) return up2.TotalMinutes;
+            return 0;
+        }
+
         /// <summary>Verdict while the VM looks unhealthy; null = healthy/still-booting.</summary>
         public static string? Verdict(string name)
         {
             if (!LastRaw.TryGetValue(name, out var raw)) return null;
             var (linux, upMin, reported, dark) = raw;
-            if (linux) return null;
+            if (linux)
+            {
+                // no heartbeat IC on linux — the honest signal is the ssh exec channel
+                if (upMin >= BootBudgetMin && !ExecOkAt.ContainsKey(name) && !ReadyCache.ContainsKey(name))
+                    return $@"no ssh readiness after {upMin:N0} min — cloud-init never finished (check serial console \.\pipe\{name}com1)";
+                return null;
+            }
             var kernelAlive = dark <= TimeSpan.FromSeconds(90);   // heartbeat flicker grace
             if (kernelAlive)
             {
@@ -431,16 +456,21 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
                                 if (linux)
                                     await engine.RunLinuxSshAsync(name, "cat /var/lib/sandbox-ready", 30, ct);
                                 else
-                                    await engine.RunPsAsync(name, Probe, 30, ct: ct);
+                                    await engine.ExecAsync(name, Probe, 30, ct: ct);
                             }
-                            catch { /* failure is enough — NoteExec already marked it */ }
+                            catch
+                            {
+                                // ssh/PS Direct stopped answering — revoke the stale Ready stamp
+                                if (ReadyCache.TryRemove(name, out _))
+                                    jobs.Blog($"{name}: readiness revoked — exec channel silent", "warn");
+                            }
                             continue;
                         }
                         try
                         {
                             var r = linux
                                 ? await engine.RunLinuxSshAsync(name, "cat /var/lib/sandbox-ready 2>/dev/null || echo NOT-YET", 30, ct)
-                                : await engine.RunPsAsync(name, Probe, 30, ct: ct);
+                                : await engine.ExecAsync(name, Probe, 30, ct: ct);
                             var outp = (r.TryGetProperty("output", out var o) ? o.GetString() : "")?.Trim() ?? "";
                             if (outp.Length > 0 && !outp.Contains("NOT-YET"))
                             {
@@ -500,7 +530,7 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
         string name, int timeoutSec = 300, CancellationToken ct = default)
     {
         var full = CheckName(name);
-        timeoutSec = Math.Clamp(timeoutSec, 10, 3600);
+        timeoutSec = Math.Clamp(timeoutSec, 30, 3600);   // floor: cold first boot needs ~60-90s
         if (ReadyCache.TryGetValue(full, out var hot))
             return new Dictionary<string, object?>
             {
@@ -542,8 +572,10 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
             await Task.Delay(5000, ct);
         }
         throw new TimeoutException(
-            $"guest desktop not ready within {timeoutSec}s (last: {lastState}). " +
-            "A VM stuck here past ~5 min usually means OOBE stalled — check Panther logs.");
+            $@"guest desktop not ready within {timeoutSec}s (last: {lastState}). " +
+            (isLinux
+                ? @"Linux: check cloud-init status or the serial console pipe \.\pipe\" + full + @"com1"
+                : @"Windows: past ~5 min this is usually OOBE stalled — check Panther logs."));
     }
 
     /// <summary>Golden images are keyed by (ISO file, edition, disk size): build once,
@@ -707,7 +739,7 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
                 foreach (Match m in SubIpRe.Matches(File.ReadAllText(f)))
                     if (int.TryParse(m.Groups[1].Value, out var oct) && oct >= 1 && oct <= 254) taken.Add(oct);
             }
-            catch { }
+            catch (Exception ex) { log.LogDebug(ex, "ip scan skipped {File}", f); }
         }
         for (var i = 10; i < 250; i++)
             if (!taken.Contains(i)) return "192.168.50." + i;
@@ -738,7 +770,11 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
                 if (doc.RootElement.TryGetProperty("ip", out var e))
                 {
                     ip = e.GetString();
-                    if (!string.IsNullOrWhiteSpace(ip)) { LinuxIpPool[vmName] = ip; return ip; }
+                    if (!string.IsNullOrWhiteSpace(ip))
+                    {
+                        lock (IpGate) LinuxIpPool.TryAdd(vmName, ip);   // visible to hole-picking
+                        return ip;
+                    }
                 }
             }
             catch { }
@@ -788,6 +824,7 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
     {
         var vmName = CheckName(name);
         ReadyCache.TryRemove(vmName, out _);
+        Watch.Forget(vmName);   // fresh create = fresh health slate (matches CreateVmAsync)
         if (!IsoCatalog.Entries.TryGetValue(iso, out var cat) || cat.Raw.Length == 0)
             throw new ArgumentException($"'{iso}' is not a linux SKU in the catalog");
         var raw = FindRaw(cat.Raw);
@@ -862,13 +899,19 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
         var ip = LinuxIp(full) ?? throw new InvalidOperationException(
             $"no ip recorded for {full} — restart the service loses the pool; VM is still reachable " +
             "from its Hyper-V console");
-        var r = await ps.RunScriptAsync("linux_ssh", new
+        PsResult r;
+        try
         {
-            mode = "exec", root = Path.Combine(cfg.Root, "Linux"),
-            host = ip, cmd = command, timeout_s = timeoutSec,
-        }, timeoutSec + 60, ct);
-        var first = r.First ?? throw new InvalidOperationException(
-            !string.IsNullOrEmpty(r.Error) ? $"ssh exec failed: {r.Error}" : "ssh exec emitted nothing");
+            r = await ps.RunScriptAsync("linux_ssh", new
+            {
+                mode = "exec", root = Path.Combine(cfg.Root, "Linux"),
+                host = ip, cmd = command, timeout_s = timeoutSec,
+            }, timeoutSec + 60, ct);
+        }
+        catch (Exception exc) { NoteExec(full, exc.Message); throw; }
+        if (r.First is not { } first0) { NoteExec(full, r.Error ?? "ssh exec failed"); throw new InvalidOperationException(!string.IsNullOrEmpty(r.Error) ? $"ssh exec failed: {r.Error}" : "ssh exec emitted nothing"); }
+        var first = first0;
+        Watch.MarkExecOk(full);
         // data[0].step='exec' with the result nested? we emit @{step='exec'} then the table:
         // simpler contract: find a member carrying 'output'
         var node = first;
@@ -955,6 +998,14 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
     {
         var full = CheckName(name);
         CheckoutStore.Touch(full);   // guest activity = holder still working
+        return await ExecAsync(full, command, timeoutSec, user, password, ct);
+    }
+
+    /// <summary>Exec WITHOUT lease renewal — background readiness pulses are
+    /// service chatter, not holder activity, so they must not immortalize a TTL.</summary>
+    public async Task<JsonElement> ExecAsync(string full, string command, int timeoutSec = 60,
+                                             string? user = null, string? password = null, CancellationToken ct = default)
+    {
         if (IsLinuxVm(full)) return await RunLinuxSshAsync(full, command, timeoutSec, ct);
         var cmdB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(command));
         PsResult r;
@@ -973,11 +1024,15 @@ public sealed class SandboxEngine(IPowerShellRunner ps, SandboxSettings cfg, ILo
         var first = r.First ?? throw new InvalidOperationException("guest exec emitted nothing");
         Watch.MarkExecOk(full);
         var wrapped = first.TryGetProperty("output", out var o) ? o.GetString() : null;
+        var errp = first.TryGetProperty("stderr", out var se) ? se.GetString() : null;
+        var exit = first.TryGetProperty("exit", out var xi) && xi.TryGetInt32(out var xv) ? xv : (int?)null;
         var timedOut = first.TryGetProperty("timed_out", out var t) && t.GetBoolean();
         return JsonSerializer.SerializeToElement(new
         {
             vm = full,
             output = wrapped,
+            stderr = string.IsNullOrWhiteSpace(errp) ? null : errp,
+            exit,
             timed_out = timedOut,
         });
     }

@@ -20,21 +20,14 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
     public async Task<JsonElement> List_vms(CancellationToken ct)
     {
         var vms = await engine.ListVmsAsync(ct);
-        return JsonSerializer.SerializeToElement(new { vms = vms.Select(AddPhase).ToList() });
-    }
-
-    static JsonElement AddPhase(JsonElement vm)
-    {
-        var o = JsonSerializer.Deserialize<Dictionary<string, object?>>(vm.GetRawText())!;
-        o["phase"] = SandboxEngine.Phase(vm);
-        return JsonSerializer.SerializeToElement(o);
+        return JsonSerializer.SerializeToElement(new { vms = vms.Select(SandboxEngine.WithPhase).ToList() });
     }
 
     [McpServerTool, Description("Full status of one sandbox VM (state, heartbeat, guest IPs). heartbeat=Ok means the guest OS is up and run_ps will answer.")]
     public async Task<JsonElement> Vm_status(string name, CancellationToken ct)
     {
         var vm = await engine.VmStatusAsync(name, ct);
-        return AddPhase(vm);
+        return SandboxEngine.WithPhase(vm);
     }
 
     [McpServerTool, Description(
@@ -96,7 +89,8 @@ public sealed class HypervSandboxTools(SandboxEngine engine)
         => JsonSerializer.SerializeToElement(await engine.WaitReadyAsync(name, timeout_s, ct));
 
     [McpServerTool, Description("Run a command INSIDE the guest: PowerShell via PowerShell Direct on "
-        + "Windows VMs, bash via SSH on Linux VMs. Returns stdout, stderr, exit code.")]
+        + "Windows VMs, bash via SSH on Linux VMs. Returns output, stderr, exit, timed_out "
+        + "(stderr/exit always present on Linux; on Windows stderr/exit appear when the guest emits them).")]
     public Task<JsonElement> Run_ps(string name, string command, CancellationToken ct, int timeout_s = 60) =>
         engine.RunPsAsync(name, command, timeout_s, ct: ct);
 

@@ -84,73 +84,80 @@ isos = {x["key"] for x in c["data"]["isos"]}
 check("catalog: three SKUs", {"server2025-eval", "win11ent-26h2", "debian-13"} <= isos, ",".join(sorted(isos)))
 
 # ---------------------------------------------------------------- full linux cycle
-NAME = "smoke"
+NAME = "smoke-%d" % os.getpid()   # PID-suffixed so concurrent runs never collide
 FULL = "mcp-" + NAME
-post("/api/create", {"name": NAME, "iso": "debian-13"})
-deadline = time.time() + 240
-row = None
-while time.time() < deadline:
-    vms = get("/api/vms")["data"]["vms"]
-    row = next((v for v in vms if v["name"] == FULL), None)
-    if row and row["phase"] == "Ready":
-        break
-    time.sleep(3)
-check("create: debian reaches Ready", bool(row and row["phase"] == "Ready"),
-      (row or {}).get("phase", "missing"))
-
-ip = (row or {}).get("ip")
-check("create: static SandboxLAN ip", bool(ip and str(ip).startswith("192.168.50.")), str(ip))
-
-r = mcp("run_ps", {"name": NAME, "command": "echo SMOKE-$((6*7)) ; hostname"})
-out = (r.get("output") or "") + (r.get("stderr") or "")
-check("run_ps: executes in guest", "SMOKE-42" in out and r.get("exit", r.get("exit_code", 0)) == 0, out.strip()[:80])
-
-r = mcp("run_ps", {"name": NAME, "command": "false"})
-check("run_ps: real exit code surfaces", r.get("exit", r.get("exit_code")) == 1, json.dumps(r)[:120])
-
-# ---------------------------------------------------------------- leases
-mcp("checkout_vm", {"name": NAME, "who": "smoke", "reason": "lease test", "ttl_min": 10})
-ls = get("/api/checkouts")["data"]
-lease = next((x for x in ls if x["name"] == FULL), None)
-check("checkout: listed", bool(lease and lease["lease"]["who"] == "smoke"), json.dumps(lease)[:120])
-
-d = mcp("delete_vm", {"name": NAME})
-check("checkout: delete skips leased", d.get("deleted") is False and d.get("holder") == "smoke", json.dumps(d)[:140])
-
-mcp("release_vm", {"name": NAME})
-d = mcp("delete_vm", {"name": NAME})
-check("release then delete works", d.get("deleted") is True, json.dumps(d)[:120])
-
-check("checkouts.json persisted", os.path.exists(
-    os.environ.get("HYPERV_ROOT", r"C:\HyperV") + os.sep + "checkouts.json"))
-
-# ---------------------------------------------------------------- dashboard
-html = None
-with urllib.request.urlopen(BASE + "/dashboard.html", timeout=30) as r:
-    html = r.read().decode("utf-8")
-check("dashboard: adaptive console markers",
-      all(k in html for k in ("selectVM", "syncConsole", "SSH terminal", "PowerShell Direct")))
-m = re.search(r"<script>(.*)</script>", html, re.S)
-js = m.group(1)
-tmp = os.path.join(os.environ.get("TMP", "."), "smoke_dash.js")
-with open(tmp, "w", encoding="utf-8") as f:
-    f.write(js)
-p = subprocess.run(["node", "--check", tmp], capture_output=True, text=True)
-check("dashboard: JS parses (node --check)", p.returncode == 0, (p.stderr or "")[:200])
-
-with urllib.request.urlopen(BASE + "/favicon.svg", timeout=15) as r:
-    check("favicon serves", r.status == 200)
-
-# cleanup: release + delete already ran (delete is an async job + /api/vms
-# caches ~4s) — poll until the row is gone instead of racing it.
 gone = False
-deadline = time.time() + 60
-while time.time() < deadline:
-    left = [v for v in get("/api/vms")["data"]["vms"] if v["name"] == FULL]
-    if not left:
-        gone = True
-        break
-    time.sleep(3)
+try:
+    post("/api/create", {"name": NAME, "iso": "debian-13"})
+    deadline = time.time() + 240
+    row = None
+    while time.time() < deadline:
+        vms = get("/api/vms")["data"]["vms"]
+        row = next((v for v in vms if v["name"] == FULL), None)
+        if row and row["phase"] == "Ready":
+            break
+        time.sleep(3)
+    check("create: debian reaches Ready", bool(row and row["phase"] == "Ready"),
+          (row or {}).get("phase", "missing"))
+
+    ip = (row or {}).get("ip")
+    check("create: static SandboxLAN ip", bool(ip and str(ip).startswith("192.168.50.")), str(ip))
+
+    r = mcp("run_ps", {"name": NAME, "command": "echo SMOKE-$((6*7)) ; hostname"})
+    out = (r.get("output") or "") + (r.get("stderr") or "")
+    check("run_ps: executes in guest", "SMOKE-42" in out and r.get("exit", r.get("exit_code", 0)) == 0, out.strip()[:80])
+
+    r = mcp("run_ps", {"name": NAME, "command": "false"})
+    check("run_ps: real exit code surfaces", r.get("exit", r.get("exit_code")) == 1, json.dumps(r)[:120])
+
+    # ------------------------------------------------------------ leases
+    mcp("checkout_vm", {"name": NAME, "who": "smoke", "reason": "lease test", "ttl_min": 10})
+    ls = get("/api/checkouts")["data"]
+    lease = next((x for x in ls if x["name"] == FULL), None)
+    check("checkout: listed", bool(lease and lease["lease"]["who"] == "smoke"), json.dumps(lease)[:120])
+
+    d = mcp("delete_vm", {"name": NAME})
+    check("checkout: delete skips leased", d.get("deleted") is False and d.get("holder") == "smoke", json.dumps(d)[:140])
+
+    mcp("release_vm", {"name": NAME})
+    d = mcp("delete_vm", {"name": NAME})
+    check("release then delete works", d.get("deleted") is True, json.dumps(d)[:120])
+
+    check("checkouts.json persisted", os.path.exists(
+        os.environ.get("HYPERV_ROOT", r"C:\HyperV") + os.sep + "checkouts.json"))
+
+    # ------------------------------------------------------------ dashboard
+    html = None
+    with urllib.request.urlopen(BASE + "/dashboard.html", timeout=30) as r:
+        html = r.read().decode("utf-8")
+    check("dashboard: adaptive console markers",
+          all(k in html for k in ("selectVM", "syncConsole", "SSH terminal", "PowerShell Direct")))
+    js = "\n;\n".join(m.group(1) for m in re.finditer(r"<script>(.*?)</script>", html, re.S))
+    tmp = os.path.join(os.environ.get("TMP", "."), "smoke_dash.js")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(js)
+    p = subprocess.run(["node", "--check", tmp], capture_output=True, text=True)
+    check("dashboard: JS parses (node --check)", p.returncode == 0, (p.stderr or "")[:200])
+
+    with urllib.request.urlopen(BASE + "/favicon.svg", timeout=15) as r:
+        check("favicon serves", r.status == 200)
+
+finally:
+    # best-effort cleanup, idempotent — runs even when a step above raised.
+    # delete is an async job + /api/vms caches ~4s — poll until the row is gone.
+    try:
+        mcp("release_vm", {"name": NAME})
+        mcp("delete_vm", {"name": NAME, "force": True})
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            left = [v for v in get("/api/vms")["data"]["vms"] if v["name"] == FULL]
+            if not left:
+                gone = True
+                break
+            time.sleep(3)
+    except Exception:
+        pass
+
 check("delete: VM actually gone", gone)
 
 print("\n%d checks, %d failed" % (total, len(fails)))

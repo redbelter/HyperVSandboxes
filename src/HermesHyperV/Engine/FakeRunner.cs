@@ -65,7 +65,7 @@ public sealed class FakeRunner : IPowerShellRunner
         try { cmd = Encoding.UTF8.GetString(Convert.FromBase64String(cmd)); } catch { }
         // readiness probe answers with a timestamp, everything else echoes
         var outp = cmd.Contains("ready.txt") ? "ready 2026-01-01T00:00:00Z" : "exec:" + cmd;
-        return Parse($$"""{"output":"{{outp}}","timed_out":false}""");
+        return Parse($$"""{"output":"{{outp}}","stderr":null,"exit":0,"timed_out":false}""");
     }
 
     /// <summary>Like the real linux_create: write meta.json beside the VM so
@@ -78,7 +78,9 @@ public sealed class FakeRunner : IPowerShellRunner
         var ip = req.GetProperty("ip").GetString() ?? "";
         File.WriteAllText(Path.Combine(root, "meta.json"),
             JsonSerializer.Serialize(new { linux = true, ip }));
-        return Parse("""{"state":"Running"}""");
+        var name = req.TryGetProperty("name", out var nm) ? nm.GetString() ?? "" : "";
+        // SerializeToElement (not string interpolation): folder paths carry backslashes.
+        return JsonSerializer.SerializeToElement(new { name, state = "Running", ip, mac = "00155d0a0b0c", folder = root });
     }
 
     static JsonElement SshResult(JsonElement req)

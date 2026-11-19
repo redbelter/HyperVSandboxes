@@ -20,11 +20,13 @@ jobs:
 
       - name: dashboard JS syntax gate
         run: |
-          node -e "const fs=require('fs');const h=fs.readFileSync('src/HermesHyperV/wwwroot/dashboard.html','utf8');const m=h.match(/<script>([\s\S]*)<\/script>/);fs.writeFileSync('dash.js',m[1]);"
-          node --check dash.js
+          node -e "const fs=require('fs');const h=fs.readFileSync('src/HermesHyperV/wwwroot/dashboard.html','utf8');let i=0;for(const m of h.matchAll(/<script>([\s\S]*?)<\/script>/g)){fs.writeFileSync('dash'+(i++)+'.js',m[1]);}"
+          node --check dash0.js
 
   smoke:
-    # Live tier: boots the service on the runner and runs tests/smoke.py against it.
+    # Live tier: boots the service and runs tests/smoke.py against it. Needs a
+    # runner WITH the Hyper-V role (self-hosted/larger runner); the mocked tier
+    # above is what windows-latest can actually run.
     needs: test
     runs-on: windows-latest
     steps:
@@ -35,7 +37,7 @@ jobs:
         shell: pwsh
         run: |
           $exe = (Get-ChildItem -Recurse -Filter HermesHyperV.exe src/HermesHyperV/bin/Release | Select-Object -First 1).FullName
-          Start-Process -FilePath $exe -ArgumentList '--console' -WindowStyle Hidden
+          Start-Process -FilePath $exe -ArgumentList '--console' -WindowStyle Hidden -WorkingDirectory (Split-Path $exe)
           $ok = $false
           for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Seconds 2

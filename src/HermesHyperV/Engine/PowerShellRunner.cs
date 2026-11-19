@@ -50,7 +50,9 @@ public sealed class PowerShellRunner(ILogger<PowerShellRunner> log) : IPowerShel
         }
 
         var sw = Stopwatch.StartNew();
-        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("powershell.exe failed to start");
+        Process proc;
+        try { proc = Process.Start(psi) ?? throw new InvalidOperationException("powershell.exe failed to start"); }
+        catch { if (tmpFile is not null) { try { File.Delete(tmpFile); } catch { } } throw; }
         var stdoutTask = proc.StandardOutput.ReadToEndAsync();
         var stderrTask = proc.StandardError.ReadToEndAsync();
 
@@ -64,6 +66,7 @@ public sealed class PowerShellRunner(ILogger<PowerShellRunner> log) : IPowerShel
         {
             try { proc.Kill(entireProcessTree: true); } catch { }
             if (tmpFile is not null) { try { File.Delete(tmpFile); } catch { } }
+            log.LogWarning("ps run {Name} timed out after {S}s", resourceName, timeoutSeconds);
             return new PsResult(false, null, $"powershell timed out after {timeoutSeconds}s");
         }
 

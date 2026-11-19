@@ -8,6 +8,10 @@ namespace HermesHyperV;
 /// /api/vms, /api/jobs, /api/log every few seconds; POST create/start/stop/
 /// delete/purge/run). Same job-spawn semantics as the Flask dashboard: long
 /// ops run in background, {job:id} returns immediately.
+///
+/// Two envelope shapes, by design:
+///   GET query endpoints  -> {ok, data, error}
+///   job spawners + polls -> minimal live shapes ({job}, {jobs}, {log,n})
 /// </summary>
 public static class Api
 {
@@ -21,7 +25,7 @@ public static class Api
             catch (Exception ex) { return Results.Json(new { ok = false, error = ex.Message }); }
         });
 
-        api.MapGet("/vms", async (SandboxEngine e, VmsCache cache) =>
+        api.MapGet("/vms", async (SandboxEngine e, VmsCache cache, ILogger<SandboxEngine> log) =>
         {
             if (cache.Hits())
                 return Results.Json(cache.Value!);
@@ -32,10 +36,11 @@ public static class Api
                 cache.Set(JsonSerializer.SerializeToElement(data));
                 return Results.Json(data);
             }
-            catch
+            catch (Exception ex)
             {
+                log.LogWarning(ex, "vm list failed");
                 // empty list with ok:false — dashboard keeps its last render
-                return Results.Json(new { ok = false, error = "vm list failed", data = new { vms = Array.Empty<object>() } });
+                return Results.Json(new { ok = false, error = ex.Message, data = new { vms = Array.Empty<object>() } });
             }
         });
 
@@ -113,24 +118,35 @@ public static class Api
             catch (Exception ex) { return Results.Json(new { ok = false, error = ex.Message }); }
         });
 
-        api.MapGet("/checkouts", () => Results.Json(new { ok = true, data = SandboxEngine.ListCheckouts() }));
-
-        api.MapGet("/catalog", () => Results.Json(new
+        api.MapGet("/checkouts", () =>
         {
-            ok = true,
-            data = new
+            try { return Results.Json(new { ok = true, data = SandboxEngine.ListCheckouts() }); }
+            catch (Exception ex) { return Results.Json(new { ok = false, error = ex.Message }); }
+        });
+
+        api.MapGet("/catalog", () =>
+        {
+            try
             {
-                isos = IsoCatalog.Entries.Select(kv => new
+                return Results.Json(new
                 {
-                    key = kv.Key,
-                    label = kv.Value.Label,
-                    edition = kv.Value.Edition,
-                    memory_mb = kv.Value.MemoryMb,
-                    disk_gb = kv.Value.DiskGb,
-                    present = EntryPresent(kv.Value),
-                }).ToList(),
-            },
-        }));
+                    ok = true,
+                    data = new
+                    {
+                        isos = IsoCatalog.Entries.Select(kv => new
+                        {
+                            key = kv.Key,
+                            label = kv.Value.Label,
+                            edition = kv.Value.Edition,
+                            memory_mb = kv.Value.MemoryMb,
+                            disk_gb = kv.Value.DiskGb,
+                            present = EntryPresent(kv.Value),
+                        }).ToList(),
+                    },
+                });
+            }
+            catch (Exception ex) { return Results.Json(new { ok = false, error = ex.Message }); }
+        });
 
         api.MapGet("/log", (JobStore jobs, int? since) =>
         {
@@ -160,22 +176,13 @@ public static class Api
             : File.Exists(Path.Combine(media, e.File));
     }
 
-    static JsonElement AddPhase(JsonElement vm)
-    {
-        var o = JsonSerializer.Deserialize<Dictionary<string, object?>>(vm.GetRawText())!;
-        o["phase"] = SandboxEngine.Phase(vm);
-        return JsonSerializer.SerializeToElement(o);
-    }
+    static JsonElement AddPhase(JsonElement vm) => SandboxEngine.WithPhase(vm);
 
     public sealed record NameReq(string? Name);
     public sealed record CheckoutReq([property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
                                      [property: System.Text.Json.Serialization.JsonPropertyName("who")] string? Who,
                                      string? Reason,
                                      [property: System.Text.Json.Serialization.JsonPropertyName("ttl_min")] int? TtlMin);
-    public sealed record RunReq([property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
-                                [property: System.Text.Json.Serialization.JsonPropertyName("cmd")] string? Cmd,
-                                [property: System.Text.Json.Serialization.JsonPropertyName("timeout_s")] int? TimeoutS);
-
     /// <summary>Agents send either field spelling; accept both.</summary>
     public sealed record RunReqBoth(
         [property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
@@ -193,8 +200,8 @@ public static class Api
 /// <summary>4s cache on the VM list, same as Flask's _vms_cache.</summary>
 public sealed class VmsCache
 {
+    // tuple is a single field assignment — atomic enough; no semaphore needed
     (DateTime T, JsonElement Data)? _cache;
-    readonly SemaphoreSlim _gate = new(1, 1);
 
     public bool Hits() => _cache is { } c && (DateTime.UtcNow - c.T).TotalSeconds < 4;
     public JsonElement? Value => _cache?.Data;

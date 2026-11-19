@@ -15,7 +15,7 @@ try {
 
   if (-not (Test-Path $key)) {
     $p = Start-Process -FilePath $keygen -ArgumentList @('-t','ed25519','-N','""','-f',($key)) -Wait -PassThru -WindowStyle Hidden
-    if ($p.ExitCode -ne 0) { throw "ssh-keygen exit $($p.ExitCode)" }
+    if ($p.ExitCode) { throw "ssh-keygen exit $($p.ExitCode)" }   # null/0 both falsy under LocalSystem
   }
 
   # Canonical CommandLineToArgvW quoting via character loop — regex -replace

@@ -179,8 +179,9 @@ Engine/PowerShellRunner  ONE hidden powershell.exe child per call; embedded
 ps1/*.ps1             the only PowerShell left, because Hyper-V cmdlets,
                       storage cmdlets and PowerShell Direct have no in-proc
                       equivalent on client Windows:
-                        provision_disk.ps1   VHDX -> bootable Windows disk
-                        golden_image.ps1     golden VHDX builder (per Windows SKU)
+                        golden_image.ps1     golden VHDX builder (Windows SKU):
+                                             mount -> dism /Apply-Image -> bcdboot
+                                             (the old provision_disk step merged in)
                         child_disk.ps1       differencing child + unattend
                         vm_lifecycle.ps1     create/power/delete/status +
                                              Linux seed (cloud-init cidata)
@@ -202,6 +203,20 @@ Linux specifics:
 - static IP `192.168.50.x` assigned by the service, host at `.1`;
 - COM1 is redirected to a named pipe (`\\.\pipe\mcp-<vm>com1`) — boot-log
   forensics with zero windows.
+
+## Tests
+
+Two tiers, both exit-code-clean for CI (`.github/workflows/ci.yml` runs them on push):
+
+```
+HYPERV_FAKE_PS=1 dotnet test tests/HermesHyperV.Tests -c Release   # mocked, no Hyper-V needed
+python tests/smoke.py                                             # live e2e against a running service
+```
+
+The mocked tier swaps in `Engine/FakeRunner.cs` (an in-process stand-in that
+mirrors the exact JSON contracts of the hidden `.ps1` scripts), so engine +
+REST + MCP + dashboard logic test anywhere. The live tier exercises the real
+Hyper-V path and needs the Hyper-V role + media on the runner.
 
 ## Security posture
 

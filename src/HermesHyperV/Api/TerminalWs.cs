@@ -79,14 +79,14 @@ public static class TerminalWs
                 {
                     while (true)
                     {
-                        int n = await src.ReadAsync(buf, CancellationToken.None);
+                        int n = await src.ReadAsync(buf, cts.Token);
                         if (n <= 0) break;
-                        await sendLock.WaitAsync();
+                        await sendLock.WaitAsync(cts.Token);
                         try
                         {
                             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
                                 await socket.SendAsync(new ArraySegment<byte>(buf, 0, n),
-                                    WebSocketMessageType.Binary, true, CancellationToken.None);
+                                    WebSocketMessageType.Binary, true, cts.Token);
                         }
                         finally { sendLock.Release(); }
                     }
@@ -112,7 +112,7 @@ public static class TerminalWs
             }
             catch { }
 
-            cts.Cancel();
+            cts.Cancel();   // stops the pumps even if a socket send is wedged
             try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
             try { await Task.WhenAny(Task.WhenAll(outPump, errPump), Task.Delay(1500)); } catch { }
             try

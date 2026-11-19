@@ -12,13 +12,14 @@ try {
   $cred = New-Object System.Management.Automation.PSCredential([string]$req.user, $sec)
   $job = Invoke-Command -VMName ([string]$req.vm) -Credential $cred -ScriptBlock $sb -AsJob
   $t = [int]$req.timeout; if ($t -le 0) { $t = 60 }   # omitted timeout must not mean 'instant'
+  $jerr = $null
   if (Wait-Job $job -Timeout $t) {
-    $r = Receive-Job $job
-    emit @{ output = ($r | Out-String); timed_out = $false }
+    $r = Receive-Job $job -ErrorVariable jerr -ErrorAction SilentlyContinue
+    emit @{ output = ($r | Out-String); stderr = (($jerr | Out-String).Trim()); timed_out = $false }
   } else {
     Stop-Job $job -ErrorAction SilentlyContinue
-    $r = Receive-Job $job -Keep -ErrorAction SilentlyContinue
-    emit @{ output = ($r | Out-String); timed_out = $true }
+    $r = Receive-Job $job -Keep -ErrorVariable jerr -ErrorAction SilentlyContinue
+    emit @{ output = ($r | Out-String); stderr = (($jerr | Out-String).Trim()); timed_out = $true }
   }
   Remove-Job $job -Force -ErrorAction SilentlyContinue
 } catch {

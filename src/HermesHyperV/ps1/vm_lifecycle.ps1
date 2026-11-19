@@ -31,11 +31,13 @@ try {
       $drv = try { (Split-Path -Qualifier $media) -replace ':','' } catch { 'C' }
       if (-not $drv) { $drv = 'C' }
       $du = Get-PSDrive $drv -ErrorAction SilentlyContinue
+      $diskHash = @{}
+      if ($du) { $diskHash[$drv + ':'] = @{ total_gb=[math]::Round(($du.Free+$du.Used)/1GB,1); free_gb=[math]::Round($du.Free/1GB,1) } }
       emit @{
         root=[string]$req.root; hypervisor_present=$hp
         vmms_service=$(if ($svc) { $svc.Status.ToString().ToLower() } else { 'not-installed' })
         isos=$isos
-        disks=@{ ($drv + ':') = @{ total_gb=[math]::Round(($du.Free+$du.Used)/1GB,1); free_gb=[math]::Round($du.Free/1GB,1) } }
+        disks=$diskHash
       }
     }
 
@@ -233,7 +235,7 @@ try {
       $vm = Get-VM -Name $name -ErrorAction SilentlyContinue
       if (-not $vm) {
         # VM config gone but leftovers can remain — sweep the folder anyway
-        if (Test-Path $root) { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($root -and (Test-Path $root)) { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
         if ($oobe -and (Test-Path $oobe)) { Remove-Item $oobe -Force -ErrorAction SilentlyContinue }
         emit @{ deleted=$true; reason='folder-only'; folder=$root }
       }
@@ -247,7 +249,7 @@ try {
             Remove-Item $p -Force -ErrorAction SilentlyContinue
           }
         }
-        if (Test-Path $root) { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($root -and (Test-Path $root)) { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
         if ($oobe -and (Test-Path $oobe)) { Remove-Item $oobe -Force -ErrorAction SilentlyContinue }
         emit @{ deleted=$true; folder=$root }
       }
@@ -266,13 +268,18 @@ try {
         if (Test-Path $root) { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
         $deleted += $n
       }
-      Get-ChildItem $media -Filter '*-oobe.xml' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-      Get-ChildItem $media -Filter '*-seed.iso' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+      Get-ChildItem $media -Filter '*-oobe.xml' -ErrorAction SilentlyContinue | Where-Object {
+        $leaf = $_.BaseName -replace '-oobe$',''; $keep -notcontains $leaf
+      } | Remove-Item -Force -ErrorAction SilentlyContinue
+      Get-ChildItem $media -Filter '*-seed.iso' -ErrorAction SilentlyContinue | Where-Object {
+        $leaf = $_.BaseName -replace '-seed$',''; $keep -notcontains $leaf
+      } | Remove-Item -Force -ErrorAction SilentlyContinue
       emit @{ deleted = $deleted }
     }
 
     'editions' {
       $iso = [string]$req.iso
+      Lock-Mount
       $m = Mount-DiskImage -ImagePath $iso -PassThru
       try {
         $vol = $m | Get-Volume
@@ -282,6 +289,7 @@ try {
         Get-WindowsImage -ImagePath $wim | ForEach-Object { emit @{ index=$_.ImageIndex; name=$_.ImageName } }
       } finally {
         Dismount-DiskImage -ImagePath $iso | Out-Null
+        Unlock-Mount
       }
     }
 

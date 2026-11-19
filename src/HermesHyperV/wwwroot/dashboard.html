@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>hyperv-sandbox — dashboard</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/xterm.css">
@@ -70,9 +71,9 @@
 <div class="wrap">
 <header>
   <h1>hyperv-sandbox</h1>
-  <span class="pill" id="conn">connecting…</span>
-  <span class="pill" id="vmmsPill">VMMS …</span>
-  <span class="pill" id="taskPill">task …</span>
+  <span class="pill" id="conn" aria-live="polite">connecting…</span>
+  <span class="pill" id="vmmsPill" aria-live="polite">VMMS …</span>
+  <span class="pill" id="taskPill" aria-live="polite">task …</span>
   <span style="flex:1"></span>
   <span class="pill">backend = HermesHyperV service · MCP on /mcp</span>
 </header>
@@ -130,17 +131,19 @@
 </div>
 <script>
 var logN = 0, jobs = {}, vmCache = [], selName = null, selMode = null;
-function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function jget(u){ return fetch(u).then(r=>r.json()); }
 function jpost(u,b){ return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json()); }
 
+var logBusy=false;
 function pollLog(){
-  jget('/api/log?since='+logN).then(d=>{
+  if(logBusy) return; logBusy=true;
+  jget('/api/log?since='+logN).then(d=>{ logBusy=false;
     var l=document.getElementById('log');
     d.log.forEach(function(x){ logN=x.n;
       l.innerHTML += '<div><span class="t">['+x.t+']</span> <span class="'+x.k+'">'+esc(x.m)+'</span></div>'; });
     l.scrollTop=l.scrollHeight;
-  }).catch(function(){});
+  }).catch(function(){ logBusy=false; });
 }
 function pollStatus(){
   jget('/api/status').then(d=>{
@@ -158,7 +161,7 @@ function pollStatus(){
       '<b>hypervisor</b><span class="'+(s.hypervisor_present?'ok':'err')+'">'+(s.hypervisor_present?'present':'absent')+'</span>'+
       '<b>VMMS service</b><span class="'+(s.vmms_running?'ok':'warn')+'">'+esc(s.vmms_service)+'</span>'+
       '<b>elevation task</b><span class="'+(s.elevation_task==='present'?'ok':'warn')+'">'+esc(s.elevation_task)+'</span>'+
-      '<b>free disk</b><span>'+(Object.values(s.disks)[0]||{}).free_gb+' GB</span>'+
+      '<b>free disk</b><span>'+esc((Object.values(s.disks)[0]||{}).free_gb)+' GB</span>'+
       '<b>ISOs</b><span>'+(s.isos.length? s.isos.map(x=>esc(x.slice(0,40))).join('<br>') :'<span class=warn>none</span>')+'</span>'+
       '<b>iso jobs</b><span>'+ (Object.keys(s.iso_jobs||{}).length? esc(JSON.stringify(s.iso_jobs)) : '—') +'</span>';
   }).catch(function(){ document.getElementById('conn').textContent='server down'; document.getElementById('conn').className='pill warn'; });
@@ -174,7 +177,7 @@ function renderVMs(data){
     var chipTxt = v.state!=='Running' ? v.state : (v.phase==='Ready'?'Ready':v.phase==='Stuck'?'stuck':v.phase==='Off'?'Off':'installing…');
     var ip = v.ip || (v.ips&&v.ips.length ? v.ips[0] : null);
     var ci = vmCache.indexOf(v);
-    var creds = v.guest_user ? ('<div class="creds">login <b title="click to copy user:password" onclick="cpw('+ci+')">'+esc(v.guest_user)+(v.guest_password?' / '+esc(v.guest_password):'')+'</b>'+
+    var creds = v.guest_user ? ('<div class="creds">login <b title="click to copy user:password" onclick="cpw('+ci+')" tabindex="0">' + esc(v.guest_user)+(v.guest_password?' / '+esc(v.guest_password):'')+'</b>'+
                   (lin&&ip?' · ssh '+esc(v.guest_user)+'@'+esc(ip):'')+'</div>') : '';
     var stuck = v.stuck ? '<div class="stucknote">'+esc(v.stuck)+'</div>' : '';
     var lease = '';
@@ -183,8 +186,8 @@ function renderVMs(data){
       lease = '<div class="lease">held by <b>'+esc(v.checkout.who)+'</b> · '+m+'m left'+
               (v.checkout.reason?' · '+esc(v.checkout.reason):'')+'</div>';
     }
-    return '<div class="vm'+(v.name===selName?' sel':'')+'" onclick="selectVM(\''+esc(v.name)+'\')"><div class="hd"><b>'+esc(v.name)+(lin?' <span class="chip">debian</span>':'')+'</b><span class="chip '+v.phase+'">'+esc(chipTxt)+'</span></div>'+
-      '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc(v.uptime.slice(0,10))+'<br>'+(ip?esc(ip):(v.state==='Running'?'no IP yet (installing / network idle)':'—'))+'</div>'+lease+stuck+creds+
+    return '<div class="vm'+(v.name===selName?' sel':'')+'" tabindex="0" role="button" aria-label="'+esc(v.name)+'" onclick="selectVM(\''+esc(v.name)+'\')" onkeydown="if(event.key===\'Enter\')selectVM(\''+esc(v.name)+'\')"><div class="hd"><b>'+esc(v.name)+(lin?' <span class="chip">debian</span>':'')+'</b><span class="chip '+v.phase+'">'+esc(chipTxt)+'</span></div>'+
+      '<div class="meta">Gen2 · '+v.cpu_count+' vCPU · '+v.mem_mb+' MB · up '+esc((v.uptime||'').slice(0,10))+'<br>'+(ip?esc(ip):(v.state==='Running'?'no IP yet (installing / network idle)':'—'))+'</div>'+lease+stuck+creds+
       '<div class="acts"><button '+(ready?'':'disabled ')+'onclick="event.stopPropagation();pick(\''+esc(v.name)+'\','+(lin?'true':'false')+')">'+(lin?'command':'powershell')+'</button>'+
       (lin?'<button '+(ready?'':'disabled ')+'onclick="event.stopPropagation();termGo(\''+esc(v.name)+'\')">terminal</button>':'')+
       (!ready&&v.state==='Running'&&!lin?'<button onclick="event.stopPropagation();diag(\''+esc(v.name)+'\')">diagnose</button>':'')+
@@ -192,18 +195,21 @@ function renderVMs(data){
       '<button '+(v.state==='Running'?'':'disabled ')+'onclick="event.stopPropagation();act(\'/api/stop\',\''+esc(v.name)+'\')" '+(v.state!=='Running'?'style=display:none':'')+'>stop</button>'+
       '<button class="danger" onclick="event.stopPropagation();act(\'/api/delete\',\''+esc(v.name)+'\')">delete</button></div></div>';
   }).join('');
-  if(selName && !vmCache.some(v=>v.name===selName)) { selName=null; selMode=null; }
+  if(selName && !vmCache.some(v=>v.name===selName)) { selName=null; selMode=null; termKill(); }
   syncConsole();
 }
 function pollVMs(){ jget('/api/vms').then(d=>{ if(d.ok!==false) renderVMs(d.data); }).catch(function(){}); }
 function pollJobs(){
   jget('/api/jobs').then(d=>{
     d.jobs.forEach(function(j){
-      if(jobs[j.id]===undefined && j.status!=='running'){
-        jobs[j.id]=true;
+      if(jobs[j.id]!==j.status && j.status!=='running'){
+        jobs[j.id]=j.status;
         if(j.name==='run_ps'){
           var c=document.getElementById('con');
-          if(j.status==='error'){ c.innerHTML += '\n<span class="err">[error] '+esc(j.error||'failed')+'</span>'; renderVMsSafe(); }
+          if(j.status==='error'){
+            if(j.result) c.innerHTML += '\n'+esc(((j.result.output||'') + (j.result.stderr?' stderr: '+j.result.stderr:'')).replace(/\n+$/,''));
+            c.innerHTML += '\n<span class="err">[error] '+esc(j.error||'failed')+'</span>'; renderVMsSafe();
+          }
           else if(j.result){
             var r=j.result;
             if(r.output) c.innerHTML += '\n'+esc(r.output.replace(/\n+$/,''));
@@ -223,7 +229,7 @@ function loadCatalog(){
   jget('/api/catalog').then(d=>{
     osCatalog=(d.data&&d.data.isos)||[];
     var s=document.getElementById('os'); if(!s) return;
-    s.innerHTML=osCatalog.map(x=>'<option value="'+x.key+'"'+(x.present?'':' title="ISO not in C:\\HyperV\\Media"')+'>'+esc(x.label)+(x.present?'':' ⬇')+'</option>').join('');
+    s.innerHTML=osCatalog.map(x=>'<option value="'+esc(x.key)+'"'+(x.present?'':' title="ISO not in C:\\HyperV\\Media"')+'>'+esc(x.label)+(x.present?'':' ⬇')+'</option>').join('');
     osPick();
   }).catch(function(){});
 }
@@ -251,16 +257,16 @@ function selectVM(n){
   selName=n;
   // pick the mode that makes sense for THIS vm
   if(!selMode) selMode = v.linux ? (v.phase==='Ready'?'term':'cmd') : (v.phase==='Ready'?'ps':'cmd');
-  syncConsole();
+  syncConsole(true);
 }
-function setMode(m){ selMode=m; syncConsole(); }
+function setMode(m){ selMode=m; syncConsole(true); }
 function pick(n,lin){
   selectVM(n);
   var v=vmCache.find(x=>x.name===n)||{};
   if(v.phase==='Ready') selMode = lin?'cmd':'ps';
-  syncConsole();
+  syncConsole(true);
 }
-function syncConsole(){
+function syncConsole(focusIt){
   var v=vmCache.find(x=>x.name===selName);
   var title=document.getElementById('conTitle'), tabs=document.getElementById('modeTabs'),
       paneRun=document.getElementById('paneRun'), paneTerm=document.getElementById('paneTerm');
@@ -295,7 +301,7 @@ function syncConsole(){
     document.getElementById('runVia').textContent='→ '+v.name+(ready?'':' (not Ready)');
     var cmd=document.getElementById('cmd');
     cmd.placeholder = v.linux ? 'df -h; uptime — bash over ssh' : 'Get-ComputerInfo | Select OsName, OsVersion';
-    if(selName) cmd.focus();
+    if(focusIt && selName) cmd.focus();
   }
 }
 function cpw(i){
@@ -319,7 +325,7 @@ function diag(n){
     var ev=h.recent_events||[];
     if(ev.length){
       c.innerHTML+='<div class="dim">recent Hyper-V events:</div>';
-      ev.forEach(function(e){ c.innerHTML+='<div class="dim" style="padding-left:12px">'+esc(e.t.slice(11))+' ['+esc(e.level)+'] '+esc(e.msg.slice(0,150))+'</div>'; });
+      ev.forEach(function(e){ c.innerHTML+='<div class="dim" style="padding-left:12px">'+esc((e.t||'').slice(11))+' ['+esc(e.level)+'] '+esc((e.msg||'').slice(0,150))+'</div>'; });
     } else c.innerHTML+='<div class="dim">no Hyper-V events for this VM in the last hour.</div>';
   });
 }
@@ -359,18 +365,19 @@ function termOpen(n){
     if(ev.data instanceof ArrayBuffer) term.write(new Uint8Array(ev.data));
     else term.write(ev.data);
   };
-  tws.onclose=function(){ termNote('disconnected'); document.getElementById('tbtn').textContent='connect'; };
+  tws.onclose=function(){ tws=null; termNote('disconnected'); document.getElementById('tbtn').textContent='connect'; };
   tws.onerror=function(){ termNote('websocket error'); };
 }
 function termGo(n){
   var v=vmCache.find(x=>x.name===n); if(!v) return;
-  selName=n; selMode='term'; syncConsole();
-  document.getElementById('conPanel').scrollIntoView({behavior:'smooth'});
+  selName=n; selMode='term'; syncConsole(true);
+  document.getElementById('conPanel').scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});
 }
 function termKill(){
   if(tws){ try{tws.onclose=null; tws.close();}catch(e){} tws=null; termNote('disconnected'); }
 }
 function termNote(s){ document.getElementById('tstate').textContent=s; }
+window.addEventListener('resize', function(){ if(tws && selName) termOpen(selName); });
 setInterval(pollLog,1500); setInterval(pollStatus,10000); setInterval(pollVMs,6000); setInterval(pollJobs,1800);
 pollStatus(); pollVMs(); pollLog(); loadCatalog();
 </script>

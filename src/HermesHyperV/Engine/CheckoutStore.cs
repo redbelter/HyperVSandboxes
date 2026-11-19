@@ -20,6 +20,14 @@ public static class CheckoutStore
     static readonly Dictionary<string, Lease> Rows = new(StringComparer.OrdinalIgnoreCase);
     static readonly JsonSerializerOptions ReadOpts = new() { PropertyNameCaseInsensitive = true };
     static bool _loaded;
+    static DateTime _lastSaved = DateTime.MinValue;
+
+    /// <summary>Test seam: forget the cached table so a test can seed its own
+    /// store file (unique HYPERV_ROOT) and observe load/prune behavior.</summary>
+    internal static void ResetForTests()
+    {
+        lock (Gate) { Rows.Clear(); _loaded = false; _lastSaved = DateTime.MinValue; }
+    }
 
     static string StorePath => Path.Combine(
         Environment.GetEnvironmentVariable("HYPERV_ROOT") ?? @"C:\HyperV", "checkouts.json");
@@ -67,7 +75,9 @@ public static class CheckoutStore
             if (!Rows.TryGetValue(name, out var le)) return;
             var now = DateTime.UtcNow;
             Rows[name] = le with { ExpiresAt = now.AddMinutes(le.TtlMin) };
-            SaveLocked();
+            // hot path: in-memory renewal always applies; the disk write is
+            // debounced so prober pulses don't convoy on file I/O
+            if (now - _lastSaved >= TimeSpan.FromSeconds(30)) SaveLocked();
         }
     }
 
@@ -95,6 +105,21 @@ public static class CheckoutStore
         };
     }
 
+    /// <summary>One-lock view: name + live lease, no re-read races.</summary>
+    public static List<KeyValuePair<string, Dictionary<string, object?>>> Snapshot()
+    {
+        lock (Gate)
+        {
+            EnsureLoaded();
+            var now = DateTime.UtcNow;
+            var list = new List<KeyValuePair<string, Dictionary<string, object?>>>();
+            foreach (var kv in Rows)
+                if (ToStatus(kv.Value, now) is { } st)
+                    list.Add(new KeyValuePair<string, Dictionary<string, object?>>(kv.Key, st));
+            return list;
+        }
+    }
+
     /// <summary>Names purge should keep (delete skips them unless forced).</summary>
     public static List<string> ActiveNames()
     {
@@ -111,7 +136,13 @@ public static class CheckoutStore
         lock (Gate)
         {
             EnsureLoaded();
-            if (Rows.Remove(name)) SaveLocked();
+            var had = Rows.Remove(name);
+            // prune other dead rows while we're here (memory mirror of SaveLocked)
+            var now2 = DateTime.UtcNow;
+            foreach (var k in Rows.Where(kv => kv.Value.ExpiresAt < now2.AddDays(-1))
+                                  .Select(kv => kv.Key).ToList())
+                Rows.Remove(k);
+            if (had) SaveLocked();
         }
     }
 
@@ -149,8 +180,11 @@ public static class CheckoutStore
                                            kv.Value.CreatedAt.ToString("o"), kv.Value.ExpiresAt.ToString("o")))
                 .ToList();
             Directory.CreateDirectory(Path.GetDirectoryName(StorePath)!);
-            File.WriteAllText(StorePath,
+            var tmp = StorePath + ".tmp";
+            File.WriteAllText(tmp,
                 JsonSerializer.Serialize(dtos, new JsonSerializerOptions { WriteIndented = true }));
+            File.Move(tmp, StorePath, overwrite: true);   // atomic-ish: readers never see a torn file
+            _lastSaved = DateTime.UtcNow;
         }
         catch { /* metadata best-effort; never fail a sandbox operation over a lease note */ }
     }

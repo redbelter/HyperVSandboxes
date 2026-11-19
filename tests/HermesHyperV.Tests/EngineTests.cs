@@ -45,6 +45,7 @@ public class EngineTests
     {
         var root = TestRoot("list");
         var e = MakeEngine(out _, root);
+        SandboxEngine.ReadyCache.TryRemove("mcp-win1", out _);   // isolated from other tests' markers
         var vms = await e.ListVmsAsync();
         var row = Assert.Single(vms);
         Assert.Equal("Installing", row.GetProperty("phase").GetString());   // hb Ok, no ready marker yet
@@ -244,6 +245,106 @@ public class EngineTests
         var after = Convert.ToInt32(CheckoutStore.Status("mcp-tz")!["remaining_s"]);
 
         Assert.True(after > before, $"expected renewal: {before} -> {after}");
+    }
+
+    [Fact]
+    public async Task Purge_carries_active_leases_in_keep_list()
+    {
+        var root = TestRoot("pk");
+        var e = MakeEngine(out var fake, root);
+        SandboxEngine.CheckoutVm("pk", "keeper", "hold", 30);
+
+        await e.PurgeAsync();
+
+        var call = fake.CallsFor("vm_lifecycle")
+            .First(x => x.TryGetProperty("action", out var a) && a.GetString() == "purge");
+        var keep = call.GetProperty("keep").EnumerateArray().Select(x => x.GetString()).ToList();
+        Assert.Contains("mcp-pk", keep);   // leased VM survives purge
+        Assert.NotNull(SandboxEngine.CheckoutVm("pk", "keeper", "hold", 30));   // leases survive purge too
+        SandboxEngine.ReleaseVm("pk");
+    }
+
+    [Fact]
+    public async Task ClaimIp_hole_picks_from_disk_after_pool_restart()
+    {
+        var root = TestRoot("ip");
+        Directory.CreateDirectory(Path.Combine(root, "Media"));
+        File.WriteAllText(Path.Combine(root, "Media", "debian-13-generic-amd64.raw"), "raw");
+        var e = MakeEngine(out var fake, root);
+
+        // two seeded guests bake .10/.11 into meta.json (simulates pool loss)
+        foreach (var pair in new[] { ("seed-a", "192.168.50.10"), ("seed-b", "192.168.50.11") })
+        {
+            Directory.CreateDirectory(Path.Combine(root, "VMs", pair.Item1));
+            File.WriteAllText(Path.Combine(root, "VMs", pair.Item1, "meta.json"),
+                "{\"linux\":true,\"ip\":\"" + pair.Item2 + "\"}");
+        }
+
+        var r = await e.CreateLinuxVmAsync("ip-new", "debian-13", ct: default);
+        var ipA = r["ip"]!.ToString();
+        Assert.StartsWith("192.168.50.", ipA);
+        Assert.True(int.Parse(ipA[(ipA.LastIndexOf('.') + 1)..]) > 11);   // hole above baked-in .10/.11
+
+        // a SECOND fresh engine (pool restart) re-reads disks and skips ipA too
+        var e2 = MakeEngine(out _, root);
+        var r2 = await e2.CreateLinuxVmAsync("ip-two", "debian-13", ct: default);
+        var ipB = r2["ip"]!.ToString();
+        Assert.NotEqual(ipA, ipB);
+    }
+
+    [Fact]
+    public async Task Expired_lease_stops_listing_and_unblocks_delete()
+    {
+        var root = TestRoot("ex");
+        Directory.CreateDirectory(root);
+        Environment.SetEnvironmentVariable("HYPERV_ROOT", root);
+        CheckoutStore.ResetForTests();
+        try
+        {
+            // seeded store: expired lease on disk
+            File.WriteAllText(Path.Combine(root, "checkouts.json"),
+                "[{\"Name\":\"mcp-ex\",\"Who\":\"gone\",\"Reason\":\"x\",\"TtlMin\":10,\"CreatedAt\":\"2020-01-01T00:00:00Z\",\"ExpiresAt\":\"2020-01-01T00:10:00Z\"}]");
+
+            var listed = SandboxEngine.ListCheckouts().EnumerateArray()
+                .Where(x => x.GetProperty("name").GetString() == "mcp-ex").ToList();
+            Assert.Empty(listed);   // expired lease not listed
+
+            var e = MakeEngine(out _, root);
+            var del = await e.DeleteVmAsync("ex");   // no lease protection -> proceeds
+            Assert.True(del.GetProperty("deleted").GetBoolean());
+        }
+        finally { Environment.SetEnvironmentVariable("HYPERV_ROOT", null); CheckoutStore.ResetForTests(); }
+    }
+
+    [Fact]
+    public void Watch_stuck_verdict_when_os_never_reports_past_budget()
+    {
+        var jobs = new JobStore(Microsoft.Extensions.Logging.Abstractions.NullLogger<JobStore>.Instance);
+        // never a healthy heartbeat + uptime past the budget = honest stuck sentence
+        SandboxEngine.Watch.Forget("w-budget");
+        var darkRow = Row("w-budget", hb: "NoContact", osrep: "", uptime: "0 00:20:00");
+        SandboxEngine.Watch.Observe("w-budget", darkRow, jobs);
+        SandboxEngine.Watch.DarkSince["w-budget"] = DateTime.UtcNow - TimeSpan.FromSeconds(120);   // past flicker grace
+        SandboxEngine.Watch.Observe("w-budget", darkRow, jobs);
+        var raw = SandboxEngine.Watch.LastRaw["w-budget"];
+        Assert.Contains("never reported", SandboxEngine.Watch.Verdict("w-budget") ?? $"raw=({raw.linux},{raw.upMin},{raw.reported},{raw.dark})");
+
+        // heartbeat back -> verdict clears
+        SandboxEngine.Watch.Observe("w-budget", Row("w-budget"), jobs);
+        Assert.Null(SandboxEngine.Watch.Verdict("w-budget"));
+    }
+
+    [Fact]
+    public async Task Diag_events_carry_t_log_id_level_msg_keys()
+    {
+        var root = TestRoot("dj");
+        var e = MakeEngine(out _, root);
+        var h = await e.VmHealthAsync("win1");
+        foreach (var ev in h.GetProperty("recent_events").EnumerateArray())
+        {
+            foreach (var key in new[] { "t", "log", "id", "level", "msg" })
+                Assert.False(string.IsNullOrEmpty(ev.GetProperty(key).ToString()));
+        }
     }
 
     static string TestRoot(string tag) =>

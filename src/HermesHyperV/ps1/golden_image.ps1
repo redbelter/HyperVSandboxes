@@ -127,7 +127,7 @@ try {
       '/English', '/Apply-Image', "/ImageFile:$wim", "/Index:$idx", ("/ApplyDir:" + $osM + '\'), "/LogPath:$log"
     ) -NoNewWindow -Wait -PassThru `
       -RedirectStandardOutput (Join-Path $dir 'dism.out') -RedirectStandardError (Join-Path $dir 'dism.err')
-    if ($p.ExitCode -ne 0) {
+    if ($p.ExitCode) {   # null/0 both falsy under LocalSystem
       $tail = if (Test-Path $log) { (Get-Content $log -Tail 20) -join ' | ' } else { '' }
       throw "dism exit $($p.ExitCode): $tail"
     }
@@ -165,7 +165,7 @@ try {
   step 'bcdboot' {
     $p = Start-Process -FilePath "$env:windir\System32\bcdboot.exe" -ArgumentList @(
       ($osM + '\Windows'), '/s', ($sysM + '\'), '/f', 'UEFI' ) -Wait -PassThru -WindowStyle Hidden
-    if ($p.ExitCode -ne 0) { throw "bcdboot exit $($p.ExitCode)" }
+    if ($p.ExitCode) { throw "bcdboot exit $($p.ExitCode)" }
   }
   step 'dismount' {
     foreach ($v in @(Get-CimInstance -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_Partition -Filter "DiskNumber=$d" -ErrorAction SilentlyContinue)) {
