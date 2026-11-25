@@ -40,7 +40,8 @@ jobs:
       - name: run service + smoke suite
         shell: pwsh
         run: |
-          $exe = (Get-ChildItem -Recurse -Filter HermesHyperV.exe src/HermesHyperV/bin/Release | Select-Object -First 1).FullName
+          $exe = "src/HermesHyperV/bin/Release/net10.0/win-x64/publish/HermesHyperV.exe"
+          if (-not (Test-Path $exe)) { throw "publish exe missing: $exe" }
           $env:HYPERV_FAKE_PS = "1"
           $env:HYPERV_ROOT = Join-Path $env:TEMP "ci-hyperv"
           Start-Process -FilePath $exe -ArgumentList '--console' -WindowStyle Hidden -WorkingDirectory (Split-Path $exe)
