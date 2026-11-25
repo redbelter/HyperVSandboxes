@@ -24,9 +24,13 @@ jobs:
           node --check dash0.js
 
   smoke:
-    # Live tier: boots the service and runs tests/smoke.py against it. Needs a
-    # runner WITH the Hyper-V role (self-hosted/larger runner); the mocked tier
-    # above is what windows-latest can actually run.
+    # Live tier: boots the REAL published exe (Windows service host, HTTP/MCP/
+    # dashboard wiring genuinely exercised) and runs tests/smoke.py against it.
+    # GitHub-hosted runners have no usable Hyper-V role (only larger runners do,
+    # actions/runner-images#9285), so the PowerShell layer is mocked via
+    # HYPERV_FAKE_PS=1 while everything above it stays real. On a self-hosted
+    # runner with the Hyper-V role + pre-baked media, drop the env var for the
+    # full real path.
     needs: test
     runs-on: windows-latest
     steps:
@@ -37,6 +41,8 @@ jobs:
         shell: pwsh
         run: |
           $exe = (Get-ChildItem -Recurse -Filter HermesHyperV.exe src/HermesHyperV/bin/Release | Select-Object -First 1).FullName
+          $env:HYPERV_FAKE_PS = "1"
+          $env:HYPERV_ROOT = Join-Path $env:TEMP "ci-hyperv"
           Start-Process -FilePath $exe -ArgumentList '--console' -WindowStyle Hidden -WorkingDirectory (Split-Path $exe)
           $ok = $false
           for ($i = 0; $i -lt 30; $i++) {

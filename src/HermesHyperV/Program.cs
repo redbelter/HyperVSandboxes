@@ -5,10 +5,11 @@ using Microsoft.Extensions.Hosting.WindowsServices;
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 {
     Args = args,
-    // when launched as a Windows service the CWD is system32; pin content
-    // root to the exe directory so wwwroot/ is found
-    ContentRootPath = WindowsServiceHelpers.IsWindowsService()
-        ? AppContext.BaseDirectory : Directory.GetCurrentDirectory(),
+    // The exe ships with wwwroot/ beside it (publish dir). Pin content root to
+    // the exe directory ALWAYS — as a service the CWD is system32, and as a
+    // console process the CWD depends on whoever launched it (CI starts it via
+    // Start-Process, other hosts may not). BaseDirectory is the one reliable spot.
+    ContentRootPath = AppContext.BaseDirectory,
 });
 
 builder.Host.UseWindowsService(o => o.ServiceName = "HermesHyperV");
